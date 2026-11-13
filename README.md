@@ -1,51 +1,51 @@
 # EVO Seat
 
-[简体中文](README.zh-CN.md) · [Install for Codex](docs/codex.md) · [Agent workflow](AGENTS.md) · [Releases](https://github.com/binaryaoucstics-lang/evo-seat/releases)
+[English](README.en.md) · [Codex 安装教程](docs/codex.zh-CN.md) · [Agent 操作说明](AGENTS.md) · [下载发行版](https://github.com/binaryaoucstics-lang/evo-seat/releases)
 
-EVO Seat gives Codex a hidden Windows desktop for operating and testing real GUI apps. An agent can launch an app, inspect its accessibility tree, send mouse and keyboard input, capture screenshots, and verify changes without taking over your foreground desktop.
+EVO Seat 为 Codex 提供一个隐藏的 Windows 桌面。Agent 可以在里面打开真实应用、读取控件、操作鼠标键盘、截图和验证结果，你可以继续使用前台桌面。
 
-- **Observe and act.** Use window IDs, accessibility snapshots, or seat-relative pixels. Pass `observeAfter: true` to `seat_element` to get a fresh snapshot after an intermediate action.
-- **Share the seat.** Use an exclusive lease or choose matching 2, 4, or 12-region layouts for concurrent agents. The seat shares the Windows account and files.
-- **Capture evidence.** Request a full-resolution PNG for small text or combine accessibility data and a screenshot when verifying a receipt.
+- **观察并操作。** 可以按窗口 ID、无障碍控件或桌面坐标操作。中间步骤给 `seat_element` 传入 `observeAfter: true`，即可在同一次调用里拿到操作后的新快照。
+- **多 Agent 协作。** 支持独占租约，以及 2、4 或 12 个分区。各分区共享 Windows 账户和文件。
+- **留存操作证据。** 看小字时可取原始尺寸 PNG，核对回执时可同时获取控件数据和截图。
 
-For installation, give your Codex agent the [installation guide](docs/codex.md). For operation, give it the [agent workflow](AGENTS.md).
+把[安装教程](docs/codex.zh-CN.md)交给 Codex 即可开始安装。安装后，让 Agent 按[操作说明](AGENTS.md)使用隐藏桌面。
 
-## Windows Paint comparison
+## Windows 画图实测对比
 
-Both runs used **`gpt-6.1-sol` with `high` reasoning effort**. Each started with a blank Windows Paint canvas and saved a 1000 × 410 PNG. EVO Seat used a hidden desktop. Built-in Computer Use used the foreground Paint window.
+两次都使用 **`gpt-6.1-sol`，推理强度为 `high`**，从空白画布开始绘制鹈鹕，保存为 1000 × 410 的 PNG。EVO Seat 使用隐藏桌面，内置 Computer Use 使用前台的画图窗口。
 
-| Measured in Codex | EVO Seat | Built-in Computer Use |
+| 实测指标 | EVO Seat | 内置 Computer Use |
 | --- | ---: | ---: |
-| Time from turn start to PNG save | 5m 24.4s | 4m 42.6s |
-| Full turn, through the final reply | 5m 36.3s | 5m 03.8s |
-| Total tokens, including cached input | 6,002,040 | 14,759,395 |
-| Cached input tokens | 5,961,856 | 14,652,288 |
-| Uncached input tokens | 33,205 | 102,239 |
-| Output tokens, including reasoning | 6,979 | 4,868 |
-| Tool calls issued by Codex | 44 | 62 |
-| Desktop API calls | 306 | 114 |
-| Drag strokes | 208 | 32 |
-| Average time per stroke (through PNG save) | 1.56 s | 8.83 s |
-| Average total tokens per stroke (including cached input) | 28,856 | 461,231 |
-| Average uncached input plus output tokens per stroke | 193 | 3,347 |
+| 从回合开始到保存 PNG | 5 分 24.4 秒 | 4 分 42.6 秒 |
+| 完整回合耗时（到最终回复） | 5 分 36.3 秒 | 5 分 03.8 秒 |
+| 总 Token（含缓存输入） | 6,002,040 | 14,759,395 |
+| 缓存输入 Token | 5,961,856 | 14,652,288 |
+| 未缓存输入 Token | 33,205 | 102,239 |
+| 输出 Token（含推理） | 6,979 | 4,868 |
+| Codex 发出的工具调用 | 44 | 62 |
+| 桌面 API 调用 | 306 | 114 |
+| 拖动画笔次数 | 208 | 32 |
+| 平均每笔耗时（按保存 PNG 前的总时间摊算） | 1.56 秒 | 8.83 秒 |
+| 平均每笔总 Token（含缓存输入） | 28,856 | 461,231 |
+| 平均每笔未缓存输入与输出 Token 之和 | 193 | 3,347 |
 
-![Bar charts comparing average time and token use per stroke for EVO Seat and built-in Computer Use](docs/images/per-stroke-comparison.en.png)
+![EVO Seat 和内置 Computer Use 的每笔平均耗时与 Token 用量对比图](docs/images/per-stroke-comparison.zh-CN.png)
 
-Times use the Codex turn log and PNG write timestamps. Token counts sum all model requests in each turn, including the conversation history sent with those requests. Codex tool calls include orchestration, such as waiting for an ongoing batch. Desktop API calls count individual `seat_*` MCP calls for EVO Seat and `sky` API calls for built-in Computer Use, including calls inside scripts. The per-stroke figures divide time through PNG save and full-turn token counts by the number of drags, so setup, screenshots, and other work are spread across the strokes.
+时间取自 Codex 回合日志和 PNG 写入时间。Token 汇总各自回合内的所有模型请求，包含随请求发送的对话历史。Codex 工具调用包含等待批处理等调度调用。桌面 API 调用按实际执行次数计算，包括脚本内部的 EVO Seat `seat_*` MCP 调用和内置 Computer Use 的 `sky` API 调用。每笔平均值用保存 PNG 前的总时间、整轮 Token 分别除以拖动次数，启动、截图等开销也摊入每笔。
 
-Built-in Computer Use saved its PNG 41.8 seconds sooner and used about 2.46× as many total tokens. The EVO Seat run batched more short strokes, while the built-in run refreshed the window after each action and started with more conversation history. These are two observed runs with different stroke counts and context sizes, so the table describes those workflows.
+本次内置 Computer Use 提前 41.8 秒保存 PNG，总 Token 约为 EVO Seat 的 2.46 倍。EVO Seat 将更多短笔画分批执行，内置版每次操作后刷新窗口，且开始时已有更长的对话历史。表格记录的是这两次实际流程，笔画数量和上下文长度并未统一。
 
 **EVO Seat**
 
-![Pelican drawn in Windows Paint using EVO Seat](docs/images/pelican.png)
+![用 EVO Seat 在 Windows 画图中画出的鹈鹕](docs/images/pelican.png)
 
-**Built-in Computer Use**
+**内置 Computer Use**
 
-![Pelican drawn in Windows Paint using built-in Computer Use](docs/images/computer-use-pelican.png)
+![用内置 Computer Use 在 Windows 画图中画出的鹈鹕](docs/images/computer-use-pelican.png)
 
-## Build from source
+## 从源码构建
 
-Use Windows x64, the .NET 10 SDK, and Node.js 22.19 or later. From the repository root:
+需要 Windows x64、.NET 10 SDK 和 Node.js 22.19 或更新版本。在仓库根目录运行：
 
 ```powershell
 npm ci --ignore-scripts
@@ -54,8 +54,8 @@ Copy-Item .\native\anode.exe .\native\evo-seat.exe
 & .\native\evo-seat.exe selftest --quick | Out-Host
 ```
 
-Then follow the setup and registration steps in the [Codex guide](docs/codex.md).
+然后按[安装教程](docs/codex.zh-CN.md)完成系统配置和 MCP 注册。
 
-## License
+## 许可
 
-[MIT](LICENSE). EVO Seat is based on [Anode](https://github.com/skulitom/Anode/tree/1ad6eae42c023654fd8de463a9d7a6e9ff787e1a) and incorporates some window containment work from BgDesk. See [third-party notices](THIRD-PARTY-NOTICES.md).
+[MIT](LICENSE)。项目基于 [Anode](https://github.com/skulitom/Anode/tree/1ad6eae42c023654fd8de463a9d7a6e9ff787e1a)，并复用了 BgDesk 的部分窗口约束逻辑。详见[第三方声明](THIRD-PARTY-NOTICES.md)。
