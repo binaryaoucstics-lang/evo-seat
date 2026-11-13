@@ -1,0 +1,60 @@
+using System.Text;
+using Anode.Core.Session;
+using Anode.Core.Bridge;
+using Anode.Core.Util;
+
+namespace Anode.Core.Launch;
+
+/// <summary>Shared by the CLI and MCP so the daemon can outlive either client.</summary>
+internal static class DaemonLauncher
+{
+    /// <summary>
+    /// An absent daemon cannot answer later in this probe. Only wait when its mutex says it is
+    /// already starting or running; still try the pipe once for compatibility with older hosts.
+    /// This is discovery, not the wait after launching a daemon.
+    /// </summary>
+    public static Task<JsonPipeClient?> ConnectExistingAsync(int timeoutMs, CancellationToken cancel = default) =>
+        ConnectExistingAsync(Env.ControlPipe, Env.DaemonMutex, timeoutMs, cancel);
+
+    internal static Task<JsonPipeClient?> ConnectExistingAsync(string pipe, string mutex, int timeoutMs, CancellationToken cancel) =>
+        JsonPipeClient.TryConnectAsync(pipe, SeatSlot.Exists(mutex) ? timeoutMs : 0, cancel);
+
+    /// <exception cref="SeatTakenException">Another channel's Anode has this Windows session's seat.</exception>
+    public static void Launch(string[] extra)
+    {
+        if (SeatSlot.Blocker() is { } taken) throw new SeatTakenException(taken);
+        Env.ResolveStateDirectory();
+        // The Task Scheduler passes no environment, so the channel travels as an argument.
+        string[] launchArguments = new[] { "--channel", Env.Channel, "up", "--state-dir", Env.StateDirectory }.Concat(extra).ToArray();
+        string arguments = string.Join(' ', launchArguments.Select(Quote));
+        try
+        {
+            SeatLauncher.LaunchInSession(
+                ChildSession.CurrentSessionId(), Env.ExecutablePath, arguments, AppContext.BaseDirectory);
+            return;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"could not start the daemon through the Task Scheduler ({ex.Message}); starting it as a child process");
+        }
+
+        DetachedProcess.Start(Env.ExecutablePath, launchArguments, AppContext.BaseDirectory);
+    }
+
+    // Windows command-line quoting, including empty arguments and backslashes
+    // immediately before a quote or the closing delimiter.
+    internal static string Quote(string argument)
+    {
+        if (argument.Length > 0 && !argument.Any(c => char.IsWhiteSpace(c) || c == '"')) return argument;
+        var quoted = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char c in argument)
+        {
+            if (c == '\\') { slashes++; continue; }
+            quoted.Append('\\', c == '"' ? slashes * 2 + 1 : slashes);
+            quoted.Append(c);
+            slashes = 0;
+        }
+        return quoted.Append('\\', slashes * 2).Append('"').ToString();
+    }
+}

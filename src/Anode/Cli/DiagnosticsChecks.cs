@@ -1,0 +1,1077 @@
+using System.Diagnostics;
+using System.ComponentModel;
+using System.Net;
+using System.Net.Sockets;
+using System.ServiceProcess;
+using System.Runtime.InteropServices;
+using System.Text.Json.Nodes;
+using Anode.Core.Bridge;
+using Anode.Core.Capture;
+using Anode.Core.Launch;
+using Anode.Core.Session;
+using Anode.Core.Util;
+using Anode.Daemon;
+
+namespace Anode.Cli;
+
+/// <summary>Private endpoints and disposable files; no seat or machine settings are changed.</summary>
+internal static class DiagnosticsChecks
+{
+    public static string SteamLaunchGuard()
+    {
+        int launches = 0;
+        Process? Launch(ProcessStartInfo _) { launches++; return null; }
+        foreach (string path in new[] { @"D:\STEAM\steam.exe", @"D:\STEAM\steam", "steam.exe", "steam", "STEAM://run/410340", "file:///D:/Steam/steam.exe" })
+        {
+            var rejected = Seat.SeatHost.RunProgram(new JsonObject { ["path"] = path }, 5, Launch, () => new[] { 3, 5 });
+            Require(rejected.Bool("ok") == false && rejected.Str("error")!.Contains("session 3") && launches == 0,
+                $"run started a conflicting Steam client or URL: {path}");
+        }
+        foreach (int[] sessions in new[] { Array.Empty<int>(), new[] { 5 } })
+            Require(Seat.SeatHost.RunProgram(new JsonObject { ["path"] = "steam.exe" }, 5, Launch, () => sessions).Bool("ok") == true,
+                "Steam was refused when no client was running outside the seat");
+        Require(launches == 2, "allowed Steam launches did not reach the process launcher");
+
+        var ordinary = new JsonObject { ["path"] = "notepad.exe", ["args"] = new JsonArray("file with spaces.txt") };
+        var reply = Seat.SeatHost.RunProgram(ordinary, 5, info =>
+        {
+            Require(info.ArgumentList.Single() == "file with spaces.txt", "run changed a program argument");
+            launches++;
+            return null;
+        }, () => throw new InvalidOperationException("ordinary program queried Steam"));
+        Require(reply.Bool("ok") == true && reply.Obj("result")?.Int("session") == 5 && launches == 3,
+            "ordinary program launch was affected by the Steam guard");
+        return "direct Steam clients and URLs are refused before process launch when Steam runs outside the seat; no Steam process started";
+    }
+
+    private static void Require(bool condition, string detail)
+    {
+        if (!condition) throw new InvalidOperationException(detail);
+    }
+
+    public static async Task<string> Listener()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var closing = new TcpListener(IPAddress.Loopback, 0);
+        closing.Start();
+        int closed = ((IPEndPoint)closing.LocalEndpoint).Port;
+        closing.Stop();
+        // Each probe waits out its connect timeout on the family nothing listens on, so the two run together.
+        var live = RdpListener.CheckAsync(port);
+        var absent = await RdpListener.CheckAsync(closed);
+        Require((await live).State == CheckLevel.Pass, "a live listener was reported missing");
+        Require(absent.State == CheckLevel.Fail && absent.Detail.Contains(closed.ToString())
+            && absent.Fix!.Contains("0x80070005"), "a closed configured port was reported ready or lacked diagnosis");
+        return "live and closed loopback ports are distinguished; missing listeners explain the next checks";
+    }
+
+    public static string RdpSettings()
+    {
+        var type = Type.GetTypeFromCLSID(new Guid("A0C63C30-F08D-4AB4-907C-34905D770C7D"), throwOnError: true)!;
+        object control = Activator.CreateInstance(type)
+            ?? throw new InvalidOperationException("Could not create the Windows Remote Desktop control.");
+        try
+        {
+            Dispatch.Set(control, "Server", "localhost");
+            var settings = (IMsRdpExtendedSettings)control;
+            foreach (bool enabled in new[] { true, false })
+            {
+                object value = enabled;
+                settings.SetProperty("ConnectToChildSession", ref value);
+                Require(settings.GetProperty("ConnectToChildSession") is bool actual && actual == enabled,
+                    "the child-session setting did not round-trip through the Windows COM interface");
+                Require(Dispatch.Get(control, "Server") as string == "localhost",
+                    "writing an extended setting changed the server instead");
+            }
+            var prompt = (IMsRdpCredentialPrompt)control;
+            foreach (bool enabled in new[] { true, false })
+            {
+                RdpViewer.ConfigureCredentialPrompt(prompt, enabled);
+                Require(prompt.GetPromptForCredentials() == enabled && !prompt.GetAllowCredentialSaving()
+                    && prompt.GetPromptForCredsOnClient() == enabled && prompt.GetAllowPromptingForCredentials() == enabled,
+                    "credential prompting was not restricted to explicit sign-in or credential saving was enabled");
+            }
+            object advanced = Dispatch.Get(control, "AdvancedSettings9")!;
+            object secured = Dispatch.Get(control, "SecuredSettings2")!;
+            Dispatch.Set(advanced, "AudioCaptureRedirectionMode", false);
+            Require(Dispatch.Get(advanced, "AudioCaptureRedirectionMode") is false, "microphone redirection was enabled");
+            foreach (int mode in new[] { 0, 2 })
+            {
+                Dispatch.Set(secured, "AudioRedirectionMode", mode);
+                Require(Convert.ToInt32(Dispatch.Get(secured, "AudioRedirectionMode")) == mode, "audio redirection setting did not round-trip");
+            }
+            // A display change is late bound: the name must resolve on this Windows build. It is looked up, never called.
+            var names = (IDispatchNames)control;
+            var none = Guid.Empty;
+            int[] ids = new int[1];
+            Require(names.GetIDsOfNames(ref none, new[] { "UpdateSessionDisplaySettings" }, 1, 0, ids) == 0,
+                "the Remote Desktop control has no UpdateSessionDisplaySettings, so the seat's display cannot change live");
+            foreach (uint scale in new uint[] { 150, 100 })
+            {
+                object value = scale;
+                settings.SetProperty("DesktopScaleFactor", ref value);
+                Require(Convert.ToUInt32(settings.GetProperty("DesktopScaleFactor")) == scale, "the seat's scaling did not round-trip");
+            }
+            return "real COM child-session, audio, scaling and credential-prompt settings round-trip and the live display change resolves; "
+                + "no connection, audio or credential prompt opened";
+        }
+        finally { Marshal.FinalReleaseComObject(control); }
+    }
+
+    /// <summary>IDispatch up to GetIDsOfNames, enough to look a member up by name without invoking it.</summary>
+    [ComImport]
+    [Guid("00020400-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IDispatchNames
+    {
+        void GetTypeInfoCount(out uint count);
+        void GetTypeInfo(uint index, uint locale, out IntPtr info);
+        [PreserveSig]
+        int GetIDsOfNames(ref Guid none, [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr)] string[] names,
+            uint count, uint locale, [Out, MarshalAs(UnmanagedType.LPArray)] int[] ids);
+    }
+
+    public static async Task<string> ViewerSignIn()
+    {
+        int hostStarts = 0, logoffs = 0, disconnects = 0;
+        using var daemon = new AnodeDaemon(new SeatOptions(), () => 42, () => null,
+            () => { hostStarts++; return Task.CompletedTask; },
+            _ => { logoffs++; return 42; }, () => disconnects++);
+        daemon.OnViewerLogonError(0);
+        Require((await daemon.StatusAsync()).Str("state") == "logon-error", "automatic login did not fail");
+
+        await daemon.ReconnectAsync(promptForCredentials: true);
+        var status = await daemon.StatusAsync();
+        Require(status.Bool("signInPrompt") == true && status.Str("state") == "connecting"
+            && status.Str("lastError") is null && logoffs == 0, "Sign in did not recover in place from failed automatic login");
+        daemon.OnViewerConnected();
+        daemon.OnViewerLogonError(0);
+        Require((await daemon.StatusAsync()).Str("state") == "signing-in" && hostStarts == 0,
+            "interactive password retry failed or started a host before login");
+        daemon.OnViewerLoginComplete();
+        Require(hostStarts == 1, "interactive login did not start the host");
+
+        await daemon.ReconnectAsync();
+        Require((await daemon.StatusAsync()).Bool("signInPrompt") == true && logoffs == 0,
+            "ordinary Reconnect forgot the seat's password sign-in or signed the seat out");
+        daemon.OnViewerLogonError(0);
+        Require((await daemon.StatusAsync()).Str("state") is "connecting" or "signing-in",
+            "ordinary Reconnect rejected a credential retry for the password seat");
+
+        await daemon.ReconnectAsync(promptForCredentials: true);
+        await daemon.StopSeatAsync("injected sign-in test; no live seat");
+        daemon.OnViewerLoginComplete();
+        Require((await daemon.StatusAsync()).Str("state") == "stopped" && hostStarts == 1
+            && logoffs == 1 && disconnects == 1, "Stop did not cancel manual sign-in");
+        Task<JsonObject> starting = daemon.StartSeatAsync();
+        Require((await daemon.StatusAsync()).Bool("signInPrompt") == false,
+            "a later unattended start inherited the toolbar's credential prompt");
+        daemon.OnViewerLogonError(0);
+        Require((await starting.WaitAsync(TimeSpan.FromSeconds(2))).Bool("ok") == false, "unattended startup hid login failure");
+
+        using var blocked = new AnodeDaemon(new SeatOptions(), () => null, () => "listener missing");
+        await blocked.ReconnectAsync(promptForCredentials: true);
+        Require((await blocked.StatusAsync()).Str("lastError") == "listener missing", "manual sign-in bypassed prerequisites");
+        return "manual sign-in and Reconnect retries, login gating, Stop and later unattended startup verified without connecting a viewer";
+    }
+
+    private const System.Reflection.BindingFlags DaemonFields = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+
+    // Only real host bring-up sets ready. Supply that result here without a window, host pipe or live seat.
+    private static void Ready(AnodeDaemon daemon)
+    {
+        typeof(AnodeDaemon).GetField("_hostReady", DaemonFields)!.SetValue(daemon, true);
+        typeof(AnodeDaemon).GetMethod("SetState", DaemonFields)!.Invoke(daemon, new object[] { "ready", "injected host ready" });
+    }
+
+    public static async Task<string> DetachedViewer()
+    {
+        static JsonObject Display(string method) => new()
+        {
+            ["width"] = 1920, ["height"] = 1080, ["scale"] = 100, ["method"] = method
+        };
+
+        foreach (bool password in new[] { true, false })
+        {
+            uint? child = 42;
+            int hostStarts = 0, logoffs = 0, displayChanges = 0;
+            using var daemon = new AnodeDaemon(new SeatOptions(), () => child, () => null,
+                () => { hostStarts++; return Task.CompletedTask; },
+                _ => { logoffs++; return null; }, () => { },
+                (_, _, _) => { displayChanges++; return Task.CompletedTask; });
+            if (password) await daemon.ReconnectAsync(promptForCredentials: true);
+            daemon.OnViewerConnected();
+            daemon.OnViewerLoginComplete();
+            Require(hostStarts == 1, "completed login did not reach the injected host");
+            Ready(daemon);
+            Require((await daemon.StatusAsync()).Str("state") == "ready", "injected host was not ready");
+
+            daemon.OnViewerDisconnected(3);
+            var status = await daemon.StatusAsync();
+            string error = status.Str("lastError") ?? "";
+            Require(status.Str("state") == "detached" && error.Contains("still running") && error.Contains("screenshots")
+                && error.Contains("password") == password && error.Contains(password ? "presses Reconnect" : "press Reconnect"),
+                "detached status lost the capture failure or the appropriate reconnect instructions: " + status.ToJsonString());
+            var live = await daemon.DisplayAsync(Display("live"));
+            Require(live.Bool("ok") == false && live.Str("error")!.Contains("viewer is disconnected")
+                && live.Str("error")!.Contains(error) && displayChanges == 0,
+                "a live display change on a detached seat reached the viewer or lost its recovery instructions");
+            var reconnected = await daemon.DisplayAsync(Display("reconnect"));
+            if (password)
+            {
+                Require(reconnected.Bool("ok") == false && reconnected.Str("error")!.Contains("viewer is disconnected")
+                    && reconnected.Str("error")!.Contains(error) && displayChanges == 0,
+                    "a display reconnect on a detached password seat reached the viewer or lost its recovery instructions");
+            }
+            else
+            {
+                // How an automatic seat comes back, as the seat host asks after a failed display reconnect.
+                Require(reconnected.Bool("ok") == true && displayChanges == 1 && (await daemon.StatusAsync()).Str("state") == "ready",
+                    "a detached automatic seat could not reconnect its viewer for a display change: " + reconnected.ToJsonString());
+                daemon.OnViewerDisconnected(3);
+                Require((await daemon.StatusAsync()).Str("state") == "detached", "the recovered seat did not detach again");
+            }
+
+            if (password)
+            {
+                Task<JsonObject> starting = daemon.StartSeatAsync();
+                Require((await daemon.StatusAsync()).Bool("signInPrompt") == false,
+                    "an unattended start inherited the password seat's prompt");
+                // A host recovery need not receive a new viewer login event; it must retain how the seat signed in.
+                Ready(daemon);
+                Require((await starting.WaitAsync(TimeSpan.FromSeconds(2))).Bool("ok") == true,
+                    "the injected host did not complete unattended startup");
+                Require((await daemon.StatusAsync()).Str("lastError") is null, "ready retained the detached error");
+                var refused = await daemon.DisplayAsync(Display("reconnect"));
+                Require(refused.Bool("ok") == false && refused.Str("error")!.Contains("Windows password") && displayChanges == 0,
+                    "resetting the attempt's prompt allowed a display reconnect on a password seat");
+                daemon.OnViewerDisconnected(3);
+            }
+
+            await daemon.ReconnectAsync();
+            status = await daemon.StatusAsync();
+            Require(status.Bool("signInPrompt") == password && status.Str("lastError") is null && logoffs == 0,
+                "Reconnect forgot the seat's sign-in choice, retained the detached error or signed the seat out");
+            daemon.OnViewerConnected();
+            daemon.OnViewerLoginComplete();
+            Ready(daemon);
+            daemon.OnViewerDisconnected(3);
+            Require((await daemon.StatusAsync()).Str("state") == "detached", "the seat did not detach before the stop");
+            await daemon.StopSeatAsync("injected detached test; no live seat");
+            status = await daemon.StatusAsync();
+            Require(status.Str("state") == "stopped" && status.Str("lastError") is null,
+                "a stopped seat still reported the detached seat's reconnect advice: " + status.Str("lastError"));
+            await daemon.ReconnectAsync();
+            Require((await daemon.StatusAsync()).Bool("signInPrompt") == false && logoffs == 1,
+                "Stop retained the ended seat's password sign-in");
+
+            if (password)
+            {
+                await daemon.ReconnectAsync(promptForCredentials: true);
+                daemon.OnViewerConnected();
+                daemon.OnViewerLoginComplete();
+                Ready(daemon);
+                child = null;
+                daemon.OnViewerDisconnected(3);
+                Require((await daemon.StatusAsync()).Str("state") == "stopped", "an absent seat was reported detached");
+                await daemon.ReconnectAsync();
+                Require((await daemon.StatusAsync()).Bool("signInPrompt") == false,
+                    "a seat that disappeared retained its password sign-in");
+            }
+        }
+        return "detached status, capture guidance, display refusals, password and automatic reconnects, Stop and ended-seat cleanup; no live seat";
+    }
+
+    public static async Task<string> StopDuringDisplayChange()
+    {
+        static JsonObject Reconnect() => new() { ["width"] = 1920, ["height"] = 1080, ["scale"] = 100, ["method"] = "reconnect" };
+        // A daemon whose viewer runs `during` (a stop, say) while it changes the display, then reconnects or, when it
+        // strands, fails the way the real viewer does when the reconnect leaves it without a connection.
+        static AnodeDaemon Seat(Func<AnodeDaemon, Task> during, bool strands)
+        {
+            AnodeDaemon? daemon = null;
+            daemon = new AnodeDaemon(new SeatOptions(), () => 42, () => null, () => Task.CompletedTask, _ => null, () => { },
+                async (_, _, _) =>
+                {
+                    await during(daemon!);
+                    if (strands) throw new AnodeDaemon.ViewerDetachedException("The viewer could not reconnect at 1920x1080.",
+                        new System.TimeoutException("Windows did not sign the viewer back in within 45 seconds."));
+                });
+            Ready(daemon);
+            return daemon;
+        }
+        static Task Stop(AnodeDaemon daemon) => daemon.StopSeatAsync("injected stop during a display change; no live seat");
+        static bool StoppedReply(JsonObject reply) => reply.Bool("ok") == false && reply["errorCode"] is null
+            && reply.Str("error")!.Contains("stopped while its display was changing");
+
+        using (var daemon = Seat(_ => Task.CompletedTask, strands: true))
+        {
+            var reply = await daemon.DisplayAsync(Reconnect());
+            var status = await daemon.StatusAsync();
+            Require(reply.Str("errorCode") == "viewer_detached" && status.Str("state") == "detached"
+                && status.Str("lastError")!.Contains("after a display change (Windows did not sign the viewer back in")
+                && status.Str("lastError")!.Contains("press Reconnect"),
+                "a reconnect that stranded the viewer did not report the seat detached with its advice: " + status.ToJsonString());
+        }
+
+        // B-039: the stop signed the seat out while the failure was on its way, so the seat is stopped, not detached.
+        using (var daemon = Seat(Stop, strands: true))
+        {
+            var reply = await daemon.DisplayAsync(Reconnect());
+            var status = await daemon.StatusAsync();
+            Require(StoppedReply(reply) && status.Str("state") == "stopped" && status.Str("lastError") is null,
+                "a display reconnect that failed during a stop reported the stopped seat detached: " + status.ToJsonString());
+        }
+
+        // A new start after the stop clears _stopRequested; a change from the stopped seat still reports nothing on it.
+        foreach (bool strands in new[] { true, false })
+        {
+            Task<JsonObject>? starting = null;
+            using var daemon = Seat(async seat => { await Stop(seat); starting = seat.StartSeatAsync(); }, strands);
+            var reply = await daemon.DisplayAsync(Reconnect());
+            Require(StoppedReply(reply) && (await daemon.StatusAsync()).Str("state") == "connecting" && !starting!.IsCompleted,
+                $"a display change {(strands ? "that failed" : "that finished")} after a stop reported on the next seat's start: " + reply.ToJsonString());
+            Require(typeof(AnodeDaemon).GetField("_display", DaemonFields)!.GetValue(daemon) is null,
+                "the stopped seat's display change carried over to the next seat");
+            await Stop(daemon);
+            Require((await starting!.WaitAsync(TimeSpan.FromSeconds(2))).Bool("ok") == false, "the injected start did not end at its stop");
+        }
+
+        // A reconnect that brings a detached viewer back doesn't make a seat ready whose host was lost meanwhile.
+        using (var daemon = Seat(seat =>
+               {
+                   typeof(AnodeDaemon).GetField("_hostReady", DaemonFields)!.SetValue(seat, false);
+                   typeof(AnodeDaemon).GetMethod("SetState", DaemonFields)!.Invoke(seat, new object[] { "detached", "Lost contact with the seat host." });
+                   return Task.CompletedTask;
+               }, strands: false))
+        {
+            daemon.OnViewerDisconnected(3);
+            var reply = await daemon.DisplayAsync(Reconnect());
+            var status = await daemon.StatusAsync();
+            Require(reply.Bool("ok") == true && status.Str("state") == "detached" && status.Str("lastError") == "Lost contact with the seat host.",
+                "a viewer reconnect reported a seat ready whose host was lost: " + status.ToJsonString());
+        }
+
+        return "a stranded display reconnect reports detached; one ending after a stop, or after a stop and a new start, leaves that state and display alone; "
+            + "a lost host stays detached; no live seat";
+    }
+
+    /// <summary>B-040: a Reconnect or Sign in refused by a missing prerequisite leaves a running seat as it was.</summary>
+    public static async Task<string> RefusedReconnect()
+    {
+        static JsonObject Display(string method) => new() { ["width"] = 1920, ["height"] = 1080, ["scale"] = 100, ["method"] = method };
+        string? missing = null;
+        bool unreadable = false;
+        // Like the viewer's own reconnect, whose waits end at once when the seat's bring-up has been cancelled; a live change has none.
+        using var daemon = new AnodeDaemon(new SeatOptions(), () => 42,
+            () => unreadable ? throw new UnauthorizedAccessException("Access is denied.") : missing, () => Task.CompletedTask, _ => null, () => { },
+            (_, reconnect, cancel) => reconnect && cancel.IsCancellationRequested ? Task.FromCanceled(cancel) : Task.CompletedTask);
+        async Task Refused(bool signIn)
+        {
+            missing = "listener missing";
+            await daemon.ReconnectAsync(promptForCredentials: signIn);
+            missing = null;
+        }
+        Ready(daemon);
+
+        foreach (bool signIn in new[] { false, true })
+        {
+            string pressed = signIn ? "Sign in" : "Reconnect";
+            await Refused(signIn);
+            var status = await daemon.StatusAsync();
+            Require(status.Str("state") == "ready" && status.Bool("agentReady") == true && status.Str("lastError") is null,
+                $"a refused {pressed} changed the running seat's state: " + status.ToJsonString());
+            // A display reconnect also proves the refused Sign in left the seat's automatic sign-in alone.
+            foreach (string method in new[] { "live", "reconnect" })
+            {
+                var reply = await daemon.DisplayAsync(Display(method));
+                Require(reply.Bool("ok") == true, $"a {method} display change after a refused {pressed} failed: " + reply.ToJsonString());
+            }
+        }
+
+        // The viewer then drops while the seat runs: that is a detached seat with its host, not a failed startup.
+        await Refused(signIn: false);
+        daemon.OnViewerDisconnected(3);
+        var detached = await daemon.StatusAsync();
+        string advice = detached.Str("lastError") ?? "";
+        Require(detached.Str("state") == "detached" && detached.Bool("agentReady") == true && advice.Contains("press Reconnect"),
+            "a viewer disconnect after a refused Reconnect dropped the running seat's host: " + detached.ToJsonString());
+
+        // Refused on the detached seat, it keeps the state and the advice, and the automatic seat's own way back still works.
+        await Refused(signIn: false);
+        var still = await daemon.StatusAsync();
+        Require(still.Str("state") == "detached" && still.Str("lastError") == advice && still.Bool("agentReady") == true,
+            "a refused Reconnect replaced the detached seat's state or advice: " + still.ToJsonString());
+        var back = await daemon.DisplayAsync(Display("reconnect"));
+        Require(back.Bool("ok") == true && (await daemon.StatusAsync()).Str("state") == "ready",
+            "the detached seat's display reconnect failed after a refused Reconnect: " + back.ToJsonString());
+
+        // Prerequisites that can't be read refuse in the same way.
+        unreadable = true;
+        await daemon.ReconnectAsync();
+        var unread = await daemon.StatusAsync();
+        Require(unread.Str("state") == "ready" && unread.Bool("agentReady") == true && unread.Str("lastError") is null,
+            "a Reconnect whose prerequisites couldn't be read changed the running seat: " + unread.ToJsonString());
+        unreadable = false;
+
+        // Once the prerequisite is back, Reconnect reconnects the viewer as before.
+        await daemon.ReconnectAsync();
+        var reconnecting = await daemon.StatusAsync();
+        Require(reconnecting.Str("state") == "connecting" && reconnecting.Bool("agentReady") == false,
+            "Reconnect did not reconnect once the prerequisite was back: " + reconnecting.ToJsonString());
+
+        // With no host serving, a Reconnect whose prerequisites can't be read reports why, as a missing one does.
+        unreadable = true;
+        await daemon.ReconnectAsync();
+        unreadable = false;
+        var failed = await daemon.StatusAsync();
+        Require(failed.Str("state") == "error" && failed.Str("lastError")?.Contains("could not check") == true && failed.Str("lastError")!.Contains("Access is denied"),
+            "a Reconnect whose prerequisites couldn't be read failed without saying why: " + failed.ToJsonString());
+        return "a refused Reconnect or Sign in keeps a ready or detached seat's state, advice, host and display changes; a later viewer disconnect detaches it; "
+            + "prerequisites that can't be read refuse the same way and say why; Reconnect works once the prerequisite is back; no live seat";
+    }
+
+    public static async Task<string> GuestOnlySignIn()
+    {
+        foreach (int? classic in new int?[] { null, 0 })
+        {
+            var row = LocalAccountSignIn.Check(classic);
+            Require(row.State == CheckLevel.Pass && row.Fix is null && LocalAccountSignIn.FailureHint(classic) is null,
+                $"doctor reported ForceGuest = {classic?.ToString() ?? "unset"} (Classic) as a problem");
+        }
+        var warning = LocalAccountSignIn.Check(1);
+        Require(warning.State == CheckLevel.Warn && warning.Detail.Contains("ForceGuest = 1") && warning.Fix?.Contains("Classic") == true
+            && warning.Fix.Contains(LocalAccountSignIn.Help), "doctor's Guest-only warning lost its value, its fix or its help: " + warning.Fix);
+        Require(warning.Name.Length <= 23, "doctor's local account sign-in row no longer fits its column");
+        Require(LocalAccountSignIn.Parse(1) == 1 && LocalAccountSignIn.Parse(null) is null, "a DWORD ForceGuest was misread");
+        foreach (Func<int?> unreadable in new Func<int?>[] { () => LocalAccountSignIn.Parse("1"), () => throw new UnauthorizedAccessException("denied") })
+        {
+            var row = LocalAccountSignIn.Row(unreadable);
+            Require(row.State == CheckLevel.Warn && row.Detail.StartsWith("could not read", StringComparison.Ordinal)
+                && row.Fix?.Contains(LocalAccountSignIn.Help) == true, "an unreadable ForceGuest was reported as Classic: " + row.Detail);
+        }
+
+        foreach (int? forceGuest in new int?[] { 1, 0 })
+        {
+            bool named(string? error) => error?.Contains("ForceGuest = 1") == true && error.Contains(LocalAccountSignIn.Help);
+            using var daemon = new AnodeDaemon(new SeatOptions(), () => 42, () => null, () => Task.CompletedTask, _ => 42, () => { },
+                forceGuest: () => forceGuest);
+            daemon.OnViewerLogonError(0);
+            var failed = await daemon.StatusAsync();
+            string refused = failed.Str("lastError")!;
+            Require(failed.Str("state") == "logon-error" && refused.Contains("could not sign in") && named(refused) == (forceGuest == 1)
+                && (forceGuest != 1 || refused.IndexOf("ForceGuest", StringComparison.Ordinal) < refused.IndexOf("Windows Hello", StringComparison.Ordinal)),
+                $"a failed automatic sign-in with ForceGuest = {forceGuest} named the sharing model wrongly or after the Sign in advice: {refused}");
+
+            // Network Level Authentication runs while the viewer connects: the reporter's credential dialog failed there.
+            await daemon.ReconnectAsync(promptForCredentials: true);
+            daemon.OnViewerDisconnected(1);
+            var ended = await daemon.StatusAsync();
+            Require(ended.Str("state") == "error" && ended.Str("lastError")!.Contains("could not start")
+                && named(ended.Str("lastError")) == (forceGuest == 1),
+                $"a sign-in ended by a disconnect while connecting with ForceGuest = {forceGuest} named the sharing model wrongly: {ended.Str("lastError")}");
+
+            // Once the viewer is connected, authentication has passed, so the setting is no longer a cause.
+            foreach (string later in new[] { "signing-in", "starting-agent" })
+            {
+                await daemon.ReconnectAsync(promptForCredentials: true);
+                daemon.OnViewerConnected();
+                if (later == "starting-agent")
+                    typeof(AnodeDaemon).GetMethod("SetState", DaemonFields)!.Invoke(daemon, new object[] { later, "injected host start" });
+                Require((await daemon.StatusAsync()).Str("state") == later, $"the stand-in seat did not reach {later}");
+                daemon.OnViewerDisconnected(1);
+                var after = await daemon.StatusAsync();
+                Require(after.Str("state") == "error" && !named(after.Str("lastError")),
+                    $"a disconnect in {later} with ForceGuest = {forceGuest} blamed the sharing model: {after.Str("lastError")}");
+            }
+        }
+        return "doctor warns about the Guest-only sharing model (ForceGuest = 1) or an unreadable value and passes Classic; a failed "
+            + "automatic sign-in (cause first) and a disconnect while connecting name it only while it is set; later disconnects never do; no live seat";
+    }
+
+    public static string RdpExtendedReasons()
+    {
+        foreach (int reason in new[] { 15, 16, 17, 18, 23, 24 })
+            Require(RdpDisconnect.ExplainExtended(reason)?.Contains("Windows ended the viewer's connection.") == true,
+                $"extended reason {reason} lost its explanation");
+        Require(RdpDisconnect.ExplainExtended(17)!.Contains("display driver"), "extended reason 17 lost the failed display driver");
+        foreach (int reason in new[] { 0, 3, 5, 256 })
+            Require(RdpDisconnect.ExplainExtended(reason) is null, $"extended reason {reason} replaced the control's description");
+        return "six Windows display/session failures explained; other extended reasons keep the control's description";
+    }
+
+    public static string CaptureUnavailableMessage()
+    {
+        string detached = ScreenCapture.UnavailableMessage(true);
+        Require(detached.Contains("disconnected") && detached.Contains("seat_status") && !detached.Contains("minimized"),
+            "disconnected capture blamed a minimized viewer or omitted the recovery instructions");
+        Require(ScreenCapture.UnavailableMessage(false) == "The seat's display is unavailable for capture. RDP may have suspended rendering while its viewer was hidden or minimized, "
+            + "or the seat may be locked. Restarting the updated Anode daemon applies its background-rendering preference. "
+            + "No foreground capture or viewer activation was attempted. Use seat_observe with includeScreenshot=false for accessible controls; do not guess screen coordinates.",
+            "capture with no known disconnection changed its existing diagnosis");
+        return "disconnected capture points to seat_status; unknown causes keep the hidden/minimized diagnosis; no screen captured";
+    }
+
+    public static string RdpHandshakeFailure()
+    {
+        DateTime started = DateTime.UtcNow;
+        object?[] data = { "RDPClient_SSL", 2, "TsSslStateHandshakeStart", 10,
+            "TsSslStateDisconnecting", 8, "TsSslEventStartHandshakeFailed", 0x80004005u };
+        Require(RdpStartupDiagnostics.DescribeFailure(Environment.ProcessId, started, started, data)?.Contains("0x80004005") == true,
+            "a terminal authentication failure lost its Windows error code");
+        Require(RdpStartupDiagnostics.DescribeFailure(-1, started, started, data) is null,
+            "another RDP client's failure was attributed to Anode");
+        Require(RdpStartupDiagnostics.DescribeFailure(Environment.ProcessId, started.AddSeconds(-1), started, data) is null,
+            "a previous connection's failure was reused");
+        data[6] = "TsSslEventStartHandshake";
+        Require(RdpStartupDiagnostics.DescribeFailure(Environment.ProcessId, started, started, data) is null,
+            "a nonterminal transition was treated as a failed handshake");
+        return "only the current process and attempt's terminal handshake failure is surfaced";
+    }
+
+    public static string RdpCallbacks()
+    {
+        var previous = SynchronizationContext.Current;
+        try { return CheckRdpCallbacks(); }
+        finally { SynchronizationContext.SetSynchronizationContext(previous); }
+    }
+
+    private static string CheckRdpCallbacks()
+    {
+        using var viewer = new RdpViewer();
+        int connections = 0;
+        int hostStarts = 0;
+        using var daemon = new AnodeDaemon(new SeatOptions { PromptForCredentials = true }, () => 42, () => null,
+            () => { hostStarts++; return Task.CompletedTask; });
+        viewer.Connecting += () => connections++;
+        viewer.Connected += daemon.OnViewerConnected;
+        viewer.LoginComplete += daemon.OnViewerLoginComplete;
+        viewer.Disconnected += daemon.OnViewerDisconnected;
+        viewer.LogonError += daemon.OnViewerLogonError;
+        var sink = new RdpViewer.EventSink(viewer);
+        IntPtr dispatch = Marshal.GetComInterfaceForObject(sink, typeof(IMsTscAxEvents));
+        try
+        {
+            var invoke = Marshal.GetDelegateForFunctionPointer<EventInvoke>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(dispatch), 6 * IntPtr.Size));
+            object? Call(int id, params object[] args)
+            {
+                const int variantSize = 24; // Anode is x64.
+                IntPtr arguments = Marshal.AllocCoTaskMem(variantSize * Math.Max(1, args.Length));
+                IntPtr result = Marshal.AllocCoTaskMem(variantSize);
+                Marshal.Copy(new byte[variantSize], 0, result, variantSize);
+                int initialized = 0;
+                try
+                {
+                    for (; initialized < args.Length; initialized++)
+                        Marshal.GetNativeVariantForObject(args[args.Length - 1 - initialized], arguments + initialized * variantSize);
+                    var parameters = new System.Runtime.InteropServices.ComTypes.DISPPARAMS
+                    { rgvarg = arguments, cArgs = args.Length };
+                    Guid iid = Guid.Empty;
+                    int hr = invoke(dispatch, id, ref iid, 0, 1, ref parameters, result, IntPtr.Zero, IntPtr.Zero);
+                    Marshal.ThrowExceptionForHR(hr);
+                    return Marshal.GetObjectForNativeVariant(result);
+                }
+                finally
+                {
+                    for (int i = 0; i < initialized; i++) VariantClear(arguments + i * variantSize);
+                    VariantClear(result);
+                    Marshal.FreeCoTaskMem(result);
+                    Marshal.FreeCoTaskMem(arguments);
+                }
+            }
+            Call(1);
+            Require(connections == 1, "native IDispatch did not deliver the RDP event");
+            Require(Call(15) is true, "OnConfirmClose did not return VARIANT_TRUE");
+            Require(Call(16, "test public key") is true, "OnReceivedTSPublicKey did not return VARIANT_TRUE");
+            Require(Call(17, 1, 1) is 0, "OnAutoReconnecting did not return its native action");
+            Call(2);
+            Call(33);
+            Require(hostStarts == 0 && !viewer.LoginCompleted,
+                "transport connection or reconnect started the host before Windows login");
+            Require(daemon.StatusAsync().GetAwaiter().GetResult().Str("state") == "signing-in",
+                "transport connection was not reported as waiting for Windows login");
+            Call(22, -2); // Winlogon is continuing, despite the event's name.
+            Call(22, 0); // Interactive bad-password prompt permits another attempt.
+            Call(3);
+            Require(hostStarts == 1 && viewer.LoginCompleted, "completed login did not start the host");
+            Call(33);
+            Require(hostStarts == 2, "automatic recovery of a logged-in viewer did not reconnect the host");
+            Call(4, 2055);
+            Require(!viewer.LoginCompleted, "disconnect retained the viewer's logged-in state");
+            Call(3);
+            Require(hostStarts == 2, "a late login event restarted a cancelled startup");
+            Call(1);
+            Require(!viewer.LoginCompleted, "a new connection reused the previous login state");
+            return "native callbacks verified; host waits for login, reconnects after login and ignores cancelled startup";
+        }
+        finally { Marshal.Release(dispatch); }
+    }
+
+    /// <summary>
+    /// Creates the hidden view-only viewer the daemon creates, then calls SetCursorPos the
+    /// way mstscax.dll does: through its own import table. Never connects to anything.
+    /// </summary>
+    public static string ViewerPointerGuard()
+    {
+        int connections = 0;
+        try
+        {
+            RdpViewer.ConnectGuarded(() => false, () => connections++);
+            throw new InvalidOperationException("the viewer accepted a missing pointer guard");
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("could not protect your desktop pointer")) { }
+        Require(connections == 0, "the viewer connected before rejecting the missing guard");
+        try { RdpViewer.ConnectGuarded(() => throw new IOException("guard failure"), () => connections++); }
+        catch (IOException) { }
+        Require(connections == 0, "an installation exception allowed a connection");
+        RdpViewer.ConnectGuarded(() => true, () => connections++);
+        Require(connections == 1, "a protected viewer could not connect");
+        foreach (bool input in new[] { false, true })
+            foreach (bool visible in new[] { false, true })
+                foreach (bool foreground in new[] { false, true })
+                    Require(PointerGuard.Allows(input, visible, foreground) == (input && visible && foreground),
+                        "the local pointer may move while the user is not driving a visible, focused viewer");
+
+        return DevelopmentChecks.OnViewerThread(CheckViewerPointerGuard, checks: TimeSpan.FromSeconds(10));
+    }
+
+    private static unsafe string CheckViewerPointerGuard(Action created)
+    {
+        using var window = new SeatWindow(new SeatOptions());
+        window.CreateHiddenViewer();
+        created();
+        Require(PointerGuard.Installed,
+            "mstscax.dll's SetCursorPos import was not found, so a program in the seat can move the real pointer");
+        IntPtr[] targets = PointerGuard.ImportTargets();
+        Require(targets.Length > 0 && targets.All(PointerGuard.IsGate), "an import of SetCursorPos still reaches user32 directly");
+        Require(PointerGuard.Install() && PointerGuard.ImportTargets().SequenceEqual(targets), "reinstalling changed an intact patch");
+
+        long suppressed = PointerGuard.Suppressed, forwarded = PointerGuard.Forwarded;
+        bool Moves(IntPtr target)
+        {
+            // One pixel, so even a broken gate cannot throw the pointer across the screen.
+            // Retried because the user may nudge the mouse onto that pixel themselves.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                var before = Core.Input.InputInjector.CursorPosition();
+                var aim = new System.Drawing.Point(before.X > 0 ? before.X - 1 : before.X + 1, before.Y);
+                Require(((delegate* unmanaged<int, int, int>)target)(aim.X, aim.Y) == 1, "a suppressed pointer move reported failure to the control");
+                if (Core.Input.InputInjector.CursorPosition() != aim) return false;
+            }
+            return true;
+        }
+        foreach (bool viewOnly in new[] { true, false })
+        {
+            window.ViewOnly = viewOnly;
+            foreach (IntPtr target in targets)
+                Require(!Moves(target), $"a hidden viewer moved the real pointer (view only: {viewOnly})");
+        }
+        Require(PointerGuard.Suppressed >= suppressed + 2 * targets.Length && PointerGuard.Forwarded == forwarded,
+            "the gate forwarded a pointer move from a hidden viewer");
+
+        // mstscax.dll calls from its own threads, which the runtime has never seen. The gate is
+        // shut here (proved above), so the argument a raw thread start cannot supply is unused.
+        window.ViewOnly = true;
+        suppressed = PointerGuard.Suppressed;
+        IntPtr thread = CreateThread(IntPtr.Zero, UIntPtr.Zero, targets[0], IntPtr.Zero, 0, out _);
+        Require(thread != IntPtr.Zero, "could not start a native thread");
+        try
+        {
+            Require(WaitForSingleObject(thread, 5000) == 0 && GetExitCodeThread(thread, out uint result) && result == 1,
+                "the gate did not answer a call from a native thread");
+        }
+        finally { CloseHandle(thread); }
+        Require(PointerGuard.Suppressed == suppressed + 1 && PointerGuard.Forwarded == forwarded,
+            "a native-thread call was not suppressed");
+        return $"{targets.Length} mstscax.dll import(s) gated; failed guards prevent connection; hidden managed/native calls cannot move the real pointer";
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int EventInvoke(IntPtr self, int id, ref Guid iid, uint locale, ushort flags,
+        ref System.Runtime.InteropServices.ComTypes.DISPPARAMS args, IntPtr result, IntPtr exception, IntPtr argumentError);
+
+    [DllImport("oleaut32.dll")]
+    private static extern int VariantClear(IntPtr variant);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateThread(IntPtr attributes, UIntPtr stackSize, IntPtr start, IntPtr parameter, uint flags, out uint threadId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeThread(IntPtr thread, out uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string SetupListener()
+    {
+        var missing = new Check("listener", CheckLevel.Fail, "listener missing", "inspect event 17");
+        var ready = new Check("listener", CheckLevel.Pass, "listener ready");
+        bool listening = false;
+        int starts = 0, restarts = 0;
+        Setup.EnsureListener(() => true, () => listening ? ready : missing,
+            () => { restarts++; listening = true; }, () => starts++, TimeSpan.Zero);
+        Require(restarts == 1 && starts == 0, "a running service with no listener was not restarted");
+        Setup.EnsureListener(() => true, () => ready, () => restarts++, () => starts++, TimeSpan.Zero);
+        Require(restarts == 1 && starts == 0, "healthy Remote Desktop was unnecessarily restarted");
+        Setup.EnsureListener(() => true, () => ready, () => restarts++, () => starts++, TimeSpan.Zero, forceRestart: true);
+        Require(restarts == 2, "changed host settings were not applied to an already running service");
+        listening = false;
+        Setup.EnsureListener(() => false, () => listening ? ready : missing,
+            () => restarts++, () => { starts++; listening = true; }, TimeSpan.Zero);
+        Require(starts == 1, "a stopped service was not started");
+        try
+        {
+            Setup.EnsureListener(() => true, () => missing, () => restarts++, () => starts++, TimeSpan.Zero);
+            throw new InvalidOperationException("setup succeeded even though the listener never appeared");
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("TermService is running, but listener missing")) { }
+
+        Setup.WaitForServiceStop(() => (ServiceControllerStatus.Stopped, 0u), 42, TimeSpan.Zero);
+        Setup.WaitForServiceStop(() => (ServiceControllerStatus.Running, 43u), 42, TimeSpan.Zero);
+        foreach (uint processId in new uint[] { 42, 0 })
+        {
+            try
+            {
+                Setup.WaitForServiceStop(() => (ServiceControllerStatus.Running, processId), 42, TimeSpan.Zero);
+                throw new InvalidOperationException("setup accepted a restart without evidence that the original service stopped");
+            }
+            catch (System.TimeoutException) { }
+        }
+        return "start, repair, healthy no-op, listener failure, and immediate service reactivation verified without changing services";
+    }
+
+    public static async Task<string> StartupFailure()
+    {
+        foreach (uint? child in new uint?[] { null, 42 })
+        {
+            using var daemon = new AnodeDaemon(new SeatOptions(), () => child, () => null);
+            Task<JsonObject> starting = daemon.StartSeatAsync();
+            daemon.OnViewerDisconnected(1800);
+            var reply = await starting.WaitAsync(TimeSpan.FromSeconds(2));
+            var status = await daemon.StatusAsync();
+            Require(reply.Bool("ok") == false && reply.Str("error")!.Contains("1800"), "startup hid the disconnect reason");
+            Require(status.Str("state") == "error" && status.Str("lastError") == reply.Str("error"),
+                "disconnect did not persist as a startup error");
+            daemon.OnViewerDisconnected(1);
+            Require((await daemon.StatusAsync()).Str("lastError") == reply.Str("error"), "a later disconnect erased the cause");
+        }
+        using var blocked = new AnodeDaemon(new SeatOptions(), () => null, () => "listener missing");
+        Require((await blocked.StartSeatAsync()).Str("error") == "listener missing", "an existing daemon bypassed readiness checks");
+        using var unattended = new AnodeDaemon(new SeatOptions(), () => null, () => null);
+        unattended.OnViewerLogonError(0);
+        Require((await unattended.StatusAsync()).Str("state") == "logon-error",
+            "an unattended bad-password failure was treated as interactive retry");
+        return "refused connections fail promptly with the reason, including when a child session already exists";
+    }
+
+    public static async Task<string> SeatCleanup()
+    {
+        Require(ChildSession.Exists(ChildSession.CurrentSessionId()) is true, "session enumeration missed the current session");
+        Require(ChildSession.Exists(uint.MaxValue) is false, "session enumeration accepted the no-session sentinel");
+        int kills = 0;
+        Require(ChildSession.HandleLogoffFailure(42, new Win32Exception(2), () => false, () => ++kills) is null
+            && kills == 0, "a reserved but absent session triggered process termination");
+        foreach (bool? exists in new bool?[] { true, null })
+        {
+            try
+            {
+                ChildSession.HandleLogoffFailure(42, new Win32Exception(2), () => exists, () => 0);
+                throw new InvalidOperationException("cleanup hid an unconfirmed logoff failure");
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 2) { }
+        }
+        int disconnects = 0;
+        using var daemon = new AnodeDaemon(new SeatOptions(), () => 42, () => null,
+            logoff: _ => throw new Win32Exception(5), disconnectViewer: () => disconnects++);
+        Task<JsonObject> starting = daemon.StartSeatAsync();
+        var stopped = await daemon.StopSeatAsync("test");
+        Require(disconnects == 1 && stopped.Bool("ok") == false,
+            "failed logoff left the viewer connected or lost its error");
+        Require((await starting.WaitAsync(TimeSpan.FromSeconds(2))).Bool("ok") == false,
+            "stop did not cancel startup after failed logoff");
+        return "absent sessions are harmless; uncertain failures remain visible; Stop disconnects despite logoff failure";
+    }
+
+    public static async Task<string> QuitHeldWindow()
+    {
+        var quit = new JsonObject { ["op"] = "quit" };
+        var grace = TimeSpan.FromMilliseconds(100);
+        async Task Settle(Func<bool> done)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while (!done() && DateTime.UtcNow < deadline) await Task.Delay(10);
+        }
+
+        // The window's loop ends when asked: quit stops the seat and leaves the process to end by itself.
+        int logoffs = 0, ends = 0, exits = 0;
+        AnodeDaemon? ordinary = null;
+        using (ordinary = new AnodeDaemon(new SeatOptions(), () => null, () => null, () => Task.CompletedTask,
+                   _ => { logoffs++; return null; }, () => { }, endMessageLoop: () => { ends++; ordinary!.MessageLoopEnded(); },
+                   exitProcess: _ => exits++, quitGrace: grace))
+        {
+            Require((await ordinary.HandleControlAsync(quit)).Bool("ok") == true, "quit was refused");
+            await Settle(() => ends > 0);
+            await Task.Delay(grace * 3);
+            Require(logoffs == 1 && ends == 1 && exits == 0, "quit did not stop the seat and end the loop, or ended a process that was exiting");
+        }
+
+        // B-031: the credential dialog of `--sign-in` holds the window's thread and keeps the exit request.
+        int heldLogoffs = 0, heldEnds = 0, disconnects = 0;
+        var exited = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var held = new AnodeDaemon(new SeatOptions { PromptForCredentials = true }, () => null, () => null,
+            () => Task.CompletedTask, _ => { heldLogoffs++; return null; }, () => disconnects++,
+            endMessageLoop: () => heldEnds++, exitProcess: code => exited.TrySetResult(code), quitGrace: grace);
+        Task<JsonObject> signingIn = held.StartSeatAsync();
+        Require((await held.StatusAsync()).Bool("signInPrompt") == true, "the test seat is not waiting for a sign-in");
+        Require((await held.HandleControlAsync(quit)).Bool("ok") == true, "quit was refused during sign-in");
+        var stillThere = await held.StartSeatAsync();
+        Require(stillThere.Bool("ok") == false && stillThere.Str("error")!.Contains("quitting"),
+            "a start while quitting was not refused: " + stillThere.ToJsonString());
+        // Once the seat has stopped: the loop is asked to end only after that.
+        await Settle(() => heldEnds > 0);
+        var acquired = await held.HandleControlAsync(new JsonObject { ["op"] = "lease", ["agentId"] = "A", ["action"] = "acquire" });
+        Require(acquired.Bool("ok") == false && acquired.Str("error")!.Contains("quitting"),
+            "an acquisition while quitting was not refused: " + acquired.ToJsonString());
+        Require((await held.HandleControlAsync(quit)).Bool("ok") == true, "a second quit was refused");
+        int code = await exited.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Require(code == 0 && heldEnds == 1 && heldLogoffs == 1 && disconnects == 1,
+            $"quit did not end a process whose window stayed held (exit {code}, {heldEnds} loop ends, {heldLogoffs} stops)");
+        Require((await signingIn.WaitAsync(TimeSpan.FromSeconds(2))).Bool("ok") == false, "the pending sign-in outlived quit");
+        await held.ReconnectAsync(promptForCredentials: true);
+        Require((await held.StatusAsync()).Str("state") == "stopped", "Sign in brought the seat back while quitting");
+        return "quit stops the seat, ends the process when a dialog holds the window, and refuses new starts meanwhile";
+    }
+
+    public static async Task<string> StartupPolling()
+    {
+        foreach (string state in new[] { "error", "logon-error", "stopped", "detached", "transport-failure" })
+        {
+            string name = $"anode-selftest-{Guid.NewGuid():N}";
+            using var server = new JsonPipeServer(name, _ => Task.FromResult(state == "transport-failure"
+                ? JsonLine.Fail("connection lost")
+                : JsonLine.Ok(new JsonObject { ["state"] = state, ["lastError"] = "refused: 1800" })));
+            server.Start();
+            using var client = await JsonPipeClient.TryConnectAsync(name, 3000)
+                ?? throw new InvalidOperationException("no test pipe");
+            try
+            {
+                await SeatStartup.WaitAsync(client).WaitAsync(TimeSpan.FromSeconds(2));
+                throw new InvalidOperationException("startup accepted a failure");
+            }
+            catch (InvalidOperationException ex) when (ex.Message == "refused: 1800" || ex.Message == "connection lost") { }
+        }
+        return "CLI/MCP startup polling immediately returns terminal states and pipe failures";
+    }
+
+    internal static int LogProbe(string[] args)
+    {
+        var options = new Args(args);
+        string marker = options.Value("marker") ?? throw new ArgumentException("log probe needs --marker");
+        // Marker is a name, never a path outside the disposable state directory.
+        if (marker != Path.GetFileName(marker)) throw new ArgumentException("Invalid log probe marker.");
+        if (options.Value("share-wait-ms") is { } wait)
+            Log.ShareWait = int.TryParse(wait, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int ms)
+                ? TimeSpan.FromMilliseconds(ms) : throw new ArgumentException("Invalid log probe wait.");
+        Log.SetRole("log-probe");
+        Log.Info(marker);
+        Env.EnsureStateDirectory();
+        string report = Path.Combine(Env.StateDirectory, marker + ".json");
+        File.WriteAllText(report + ".tmp", new JsonObject
+        {
+            ["logPath"] = Env.LogPath, ["logError"] = Log.LastWriteError,
+            ["session"] = ChildSession.CurrentSessionId()
+        }.ToJsonString());
+        File.Move(report + ".tmp", report, overwrite: true);
+        return Log.LastWriteError is null ? 0 : 1;
+    }
+
+    private static string ProbeArguments(string directory, string marker, int? shareWaitMs = null) =>
+        $"__log-probe --state-dir {DaemonLauncher.Quote(directory)} --marker {marker}"
+        + (shareWaitMs is { } ms ? $" --share-wait-ms {ms}" : "");
+
+    public static async Task<string> Logging()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"anode-selftest log {Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        string log = Path.Combine(directory, "anode.log");
+        try
+        {
+            using (var held = new FileStream(log, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            {
+                // A short wait keeps this quick; the shipped wait is checked below.
+                var failure = await RunProbe(directory, "locked", shareWaitMs: 100);
+                var result = JsonLine.Parse(await File.ReadAllTextAsync(Path.Combine(directory, "locked.json")))!;
+                Require(failure.Code == 1 && failure.Error.Contains("Cannot write Anode log")
+                    && result.Str("logError")!.Contains(log), "log write failure was silent or lost the path");
+            }
+            Require((await RunProbe(directory, "recovered")).Code == 0, "logging did not recover after the file was unlocked");
+            Require((await File.ReadAllTextAsync(log)).Contains("[log-probe]") && (await File.ReadAllTextAsync(log)).Contains("recovered"),
+                "subprocess did not use its explicit state directory");
+            // A line waits out another writer that keeps the file longer than the 100 ms it used to (B-054).
+            Require(Log.LastWriteError is null, $"the self-test's own log is failing: {Log.LastWriteError}");
+            string busy = Path.Combine(directory, "busy.log");
+            var holder = new FileStream(busy, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+            var release = Task.Run(async () => { await Task.Delay(300); holder.Dispose(); });
+            try { using (Log.Divert(busy)) Log.Info("after the other writer"); }
+            finally { await release; }
+            Require((await File.ReadAllTextAsync(busy)).Contains("after the other writer"),
+                $"a line gave up while another writer held the log for 300 ms: {Log.LastWriteError}");
+            var writers = Enumerable.Range(0, 8).Select(i => RunProbe(directory, $"writer-{i}")).ToArray();
+            var results = await Task.WhenAll(writers);
+            Require(results.All(r => r.Code == 0), "concurrent log writers failed: " + string.Join("; ", results
+                .Select((r, i) => (r, i)).Where(x => x.r.Code != 0).Select(x => $"writer-{x.i} exit {x.r.Code}: {x.r.Error.Trim()}")));
+            var lines = await File.ReadAllLinesAsync(log);
+            foreach (int i in Enumerable.Range(0, 8))
+                Require(lines.Count(line => line.EndsWith($"writer-{i}")) == 1, "a concurrent log line was lost or duplicated");
+            return "explicit paths, a line outlasting another writer's 300 ms hold, concurrent subprocess writers, and visible write failures verified";
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    /// <summary>
+    /// The self-test's checks log made-up seats, launches and failures, so their lines go to a file of
+    /// their own, never the user's log; a diversion inside it ends where it began.
+    /// </summary>
+    public static string SelfTestLog()
+    {
+        string? own = Log.Diverted;
+        Require(own is not null && !string.Equals(Path.GetDirectoryName(Path.GetFullPath(own)), Env.StateDirectory, StringComparison.OrdinalIgnoreCase),
+            "the self-test's checks write to the user's log");
+        string directory = Path.Combine(Path.GetTempPath(), "anode-selftest-divert-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string outer = Path.Combine(directory, "outer.log"), inner = Path.Combine(directory, "inner.log");
+            using (Log.Divert(outer))
+            {
+                using (Log.Divert(inner)) Log.Info("inner line");
+                Log.Info("outer line");
+            }
+            Require(Log.Diverted == own, "a diversion did not end where it began");
+            string innerText = File.ReadAllText(inner), outerText = File.ReadAllText(outer);
+            Require(innerText.Contains("inner line") && !innerText.Contains("outer line")
+                && outerText.Contains("outer line") && !outerText.Contains("inner line"), "diverted lines reached the wrong file");
+            return "the checks log to a file of their own, not the user's log; nested diversions end where they began";
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    /// <summary>
+    /// A log line's time reads the same in every culture, so the log sorts and parses alike everywhere: Thai Windows
+    /// would write the Buddhist year (2569), Saudi Windows the Hijri one, and Finnish Windows dots between the hours,
+    /// minutes and seconds.
+    /// </summary>
+    public static string LogTimestamps()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "anode-selftest-stamps-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            foreach (string name in new[] { "th-TH", "ar-SA", "fi-FI" })
+            {
+                string path = Path.Combine(directory, name + ".log");
+                System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo(name);
+                int year = DateTime.Now.Year;
+                using (Log.Divert(path)) Log.Info("stamped line");
+                string line = File.ReadAllText(path).TrimEnd();
+                var stamp = System.Text.RegularExpressions.Regex.Match(line, @"^(\d{4})-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} INFO ");
+                Require(stamp.Success && Math.Abs(int.Parse(stamp.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) - year) <= 1,
+                    $"the {name} culture changed the log's timestamp: {line}");
+            }
+            return "log lines carry a Gregorian, colon-separated time under the Thai, Saudi and Finnish cultures";
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = culture;
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task<(int Code, string Error)> RunProbe(string directory, string marker, int? shareWaitMs = null)
+    {
+        using var process = Process.Start(new ProcessStartInfo(Env.ExecutablePath, ProbeArguments(directory, marker, shareWaitMs))
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true
+        }) ?? throw new InvalidOperationException("could not launch the log probe");
+        Task<string> error = process.StandardError.ReadToEndAsync();
+        Task<string> output = process.StandardOutput.ReadToEndAsync();
+        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); }
+        finally { if (!process.HasExited) { process.Kill(); await process.WaitForExitAsync(); } }
+        Require((await output).Length == 0, "log diagnostics polluted stdout");
+        return (process.ExitCode, await error);
+    }
+
+    /// <summary>Where <c>rendering --restore</c> looks for its backup, in a disposable folder. The registry is not touched.</summary>
+    public static string RenderingBackups()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "anode-rendering-check-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string local = Path.Combine(root, "Local"), state = Path.Combine(local, "Anode");
+            string Package(string name) => Path.Combine(local, "Packages", name, "LocalCache", "Local", "Anode");
+            string Save(string folder)
+            {
+                Directory.CreateDirectory(folder);
+                string file = Path.Combine(folder, "rdp-rendering-backup.json");
+                File.WriteAllText(file, "{\"PreviousValue\":null}");
+                return file;
+            }
+            List<string> Found(bool chosen = false, string folder = "Anode") => BackgroundRendering.Backups(state, chosen, local, folder);
+
+            Directory.CreateDirectory(state);
+            Require(Found().Count == 0, "a backup was found with no Packages folder");
+            Directory.CreateDirectory(Path.Combine(local, "Packages", "Other.App_1", "LocalCache", "Local"));
+            string claude = Save(Package("Claude_1"));
+            Require(Found() is [var one] && one == claude, "the backup a packaged app's daemon saved was missed: " + string.Join(", ", Found()));
+            Require(Found(chosen: true).Count == 0, "--state-dir did not limit the search to its own folder");
+            Require(Found(folder: "Anode-dev").Count == 0, "another channel's backup was used");
+            string codex = Save(Package("OpenAI.Codex_1"));
+            Require(Found() is [var first, var second] && first == claude && second == codex, "two packaged apps' backups were not both listed");
+            string own = Save(state);
+            Require(Found() is [var mine] && mine == own, "the state directory's own backup did not take precedence");
+            // Inside a packaged app the state directory resolves into the app's folder; restoring from there is refused.
+            Require(BackgroundRendering.PackagedRefusal(Package("Claude_1"), false, local) is { } refusal
+                && refusal.Contains("your own terminal", StringComparison.Ordinal), "rendering --restore inside a packaged app was not refused");
+            Require(BackgroundRendering.PackagedRefusal(Package("Claude_1"), true, local) is null && BackgroundRendering.PackagedRefusal(state, false, local) is null,
+                "rendering --restore was refused in an ordinary terminal or with --state-dir");
+            return "the state directory's backup first; without --state-dir, packaged apps' Anode folders too, never another channel's; refused inside a packaged app";
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    public static string ScheduledLogging()
+    {
+        string directory = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+            "Anode", $"selftest scheduled log {Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string physicalDirectory = Env.ResolveDirectory(directory);
+            SeatLauncher.LaunchInSession(ChildSession.CurrentSessionId(), Env.ExecutablePath,
+                ProbeArguments(physicalDirectory, "scheduled"), AppContext.BaseDirectory);
+            string marker = Path.Combine(directory, "scheduled.json");
+            var watch = Stopwatch.StartNew();
+            while (!File.Exists(marker) && watch.Elapsed < TimeSpan.FromSeconds(15)) Thread.Sleep(100);
+            Require(File.Exists(marker), "the scheduled logging probe never completed");
+            var result = JsonLine.Parse(File.ReadAllText(marker))!;
+            Require(result.Str("logError") is null, result.Str("logError") ?? "scheduled log failed");
+            Require(result.Str("logPath") == Path.Combine(physicalDirectory, "anode.log"), "scheduler lost the log path");
+            Require(File.ReadAllText(Path.Combine(directory, "anode.log")).Contains("scheduled"), "scheduled log line is missing");
+            Require(result.Int("session") == ChildSession.CurrentSessionId(), "scheduler launched in a different session");
+            return $"scheduled Anode in session {result.Int("session")} wrote to the requested log";
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+}

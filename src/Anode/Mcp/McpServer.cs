@@ -1,0 +1,557 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Anode.Core.Bridge;
+using Anode.Core.Desktop;
+using Anode.Core.Launch;
+using Anode.Core.Util;
+using Anode.Core.Agents;
+
+namespace Anode.Mcp;
+
+/// <summary>
+/// A Model Context Protocol server over stdin and stdout, so an agent can hold a seat
+/// the way it holds any other tool.
+///
+/// It owns nothing. Live tools use the daemon over the control pipe; only seat_start and
+/// seat_lease acquisition may start it. Guide discovery is local; status never starts a
+/// daemon. That means an agent and a person can both be pointed at the same seat, and the
+/// person's stop button still wins.
+/// </summary>
+internal sealed class McpServer : IDisposable
+{
+    internal const string NotRunning =
+        Brand.Name + " is not running. Call seat_lease with action=acquire when the task needs a background desktop; it starts a hidden seat.";
+    internal const string LeaseEnded =
+        Brand.Name + " is not running or your lease ended. Call seat_lease action=acquire, then observe again.";
+    internal const string SeatStopped =
+        "The seat is stopped. Call seat_lease with action=acquire when the task needs a background desktop; it starts the seat again.";
+    internal const string SeatStoppedLease =
+        "The seat was stopped, which ended your lease. Call seat_lease action=acquire, then observe again.";
+    internal const string TookLease =
+        Brand.Name + " took the desktop lease for this agent; each desktop action keeps it. Release it with seat_lease action=release when you finish.";
+    internal const string LookFirst =
+        "The desktop may have changed since you last looked: " + Brand.Name + " took the desktop lease for this agent, or your previous lease ended. "
+        + "Pointer, keyboard and gamepad input waits until you observe it (seat_screenshot, seat_observe, or seat_windows without a filter); "
+        + "then repeat this action.";
+    internal const string LookBeforeInput =
+        "Pointer, keyboard and gamepad input waits until you observe the desktop (seat_screenshot, seat_observe, or seat_windows without a filter).";
+
+    /// <summary>How long an explicit acquire waits in line when the agent does not say.</summary>
+    internal const int DefaultWaitSeconds = 30;
+
+    private JsonPipeClient? _daemon;
+    private string? _blockedReason, _seatTaken;
+    private bool _launchPending;
+    private int _layeredLaunchCount;
+    private int? _leaseTtlSeconds;
+    private readonly string _agentId;
+    // A generated identity cannot be resumed after this process ends.
+    private readonly bool _ephemeral;
+    private readonly bool _namePinned;
+    private readonly string? _workspace;
+    private string? _agentName;
+    private string? _leaseToken;
+    // Set when this server takes the lease for the agent or the agent's lease ends, cleared by its next look at the desktop.
+    private bool _lookPending;
+    // The client's negotiated MCP version; results use only the content types it defines.
+    private string _protocol = McpSession.LatestProtocol;
+    private readonly string _controlPipe;
+    private readonly Action _launchDaemon;
+    private readonly Func<string?> _blockingSummary;
+    private readonly SemaphoreSlim ConnectGate = new(1, 1);
+
+    internal McpServer(string? controlPipe = null, Action? launchDaemon = null, Func<string?>? blockingSummary = null, string? agentId = null,
+        string? workingDirectory = null)
+    {
+        // Checks use private pipes. They must never reach Task Scheduler or the real readiness probe.
+        if (controlPipe is not null && controlPipe != Env.ControlPipe && (launchDaemon is null || blockingSummary is null))
+            throw new ArgumentException("A private control pipe requires an injected launcher and readiness check.", nameof(controlPipe));
+        _controlPipe = controlPipe ?? Env.ControlPipe;
+        _launchDaemon = launchDaemon ?? (() => DaemonLauncher.Launch(Core.Layers.LayerHub.StartupArguments(_layeredLaunchCount)));
+        _blockingSummary = blockingSummary ?? Core.Session.Preconditions.BlockingSummary;
+        // An empty value (for example an unset MCPB user_config field) means no stable identity.
+        string? configured = Environment.GetEnvironmentVariable("ANODE_AGENT_ID");
+        _ephemeral = Environment.GetEnvironmentVariable("ANODE_EPHEMERAL") == "1" ||
+            agentId is null && string.IsNullOrWhiteSpace(configured);
+        _agentId = agentId ?? (string.IsNullOrWhiteSpace(configured) ? null : configured) ?? "a_" + Guid.NewGuid().ToString("N");
+        string? named = Environment.GetEnvironmentVariable("ANODE_AGENT_NAME")?.Trim();
+        if (AgentAccess.ValidName(named)) { _agentName = named; _namePinned = true; }
+        // MCP clients start their servers in the session's project folder.
+        _workspace = Workspace(workingDirectory ?? Environment.CurrentDirectory);
+    }
+
+    /// <summary>Whether this connection holds a cached lease token.</summary>
+    internal bool HoldsLease => _leaseToken is not null;
+
+    /// <summary>The name other agents and the viewer see for this agent's lease.</summary>
+    internal string? AgentName => _agentName;
+
+    /// <summary>Takes what the client's initialize established: its name and the negotiated protocol version.</summary>
+    internal void Initialized(string? clientName, string protocolVersion)
+    {
+        _protocol = protocolVersion;
+        Identify(clientName);
+    }
+
+    /// <summary>
+    /// Names this agent after its MCP client and the project folder it runs in, such as
+    /// "Claude Code in WebShop", so status and the viewer can say which session holds the desktop:
+    /// every session of one client has the same client name. ANODE_AGENT_NAME takes precedence.
+    /// </summary>
+    internal void Identify(string? clientName)
+    {
+        if (_namePinned || string.IsNullOrWhiteSpace(clientName)) return;
+        string client = clientName.Trim() switch
+        {
+            "claude-code" => "Claude Code",
+            "claude-ai" => "Claude",
+            "codex-mcp-client" or "codex" => "Codex",
+            string other => other
+        };
+        string name = _workspace is null ? client : $"{client} in {_workspace}";
+        name = new string(name.Where(c => !char.IsControl(c)).Take(64).ToArray()).Trim();
+        if (AgentAccess.ValidName(name)) _agentName = name;
+    }
+
+    /// <summary>
+    /// The name of the folder a client started this server in, when it can be a project: not a drive
+    /// root or the profile itself, and not inside Windows, program, app-data or temporary folders or
+    /// Anode's own, where a client started from no project runs its servers.
+    /// </summary>
+    internal static string? Workspace(string? directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory)) return null;
+        string path;
+        try { path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)); }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or System.Security.SecurityException) { return null; }
+
+        static bool Same(string a, string b) => a.Equals(Path.TrimEndingDirectorySeparator(b), StringComparison.OrdinalIgnoreCase);
+        static bool Within(string a, string folder) => folder.Length > 0
+            && (Same(a, folder) || a.StartsWith(Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+        if (Path.GetPathRoot(path) is { } root && Same(path, root)) return null;
+        if (Same(path, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))) return null;
+        foreach (string folder in new[]
+                 {
+                     Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                     Path.GetTempPath(),
+                     AppContext.BaseDirectory
+                 })
+            if (Within(path, folder)) return null;
+        string name = Path.GetFileName(path);
+        return name.Length > 0 ? name : null;
+    }
+
+    /// <summary>How long a call waits for an existing daemon's pipe before treating Anode as stopped.</summary>
+    internal int ConnectTimeoutMs { get; init; } = 1000;
+
+    public static async Task<int> Run(string? agentId = null)
+    {
+        Log.SetRole("mcp");
+        Log.Info("MCP server starting");
+        using var server = new McpServer(agentId: agentId);
+        using var stdin = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
+        using var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        try { await new McpSession(server.CallAsync, server.Initialized).RunAsync(stdin, stdout).ConfigureAwait(false); }
+        finally
+        {
+            // Nothing can resume a generated identity, so its lease would only keep other agents
+            // waiting until it expired. A stable ANODE_AGENT_ID keeps it for a restarted session.
+            if (server._ephemeral) await server.ReleaseAsync().ConfigureAwait(false);
+            Log.Info("MCP server stopped");
+        }
+        return 0;
+    }
+
+    /// <summary>Hands this agent's lease on when its session ends. Brief and best effort; expiry is the fallback.</summary>
+    internal async Task ReleaseAsync()
+    {
+        if (_leaseToken is null) return;
+        try
+        {
+            using var client = await JsonPipeClient.TryConnectAsync(_controlPipe, 1000).ConfigureAwait(false);
+            if (client is null) return;
+            // An action the session cancelled may still be finishing in the seat; the release waits briefly for it.
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                var response = await client.RequestAsync("lease",
+                    AgentAccess.Attach(new JsonObject { ["action"] = "release" }, _agentId, _leaseToken), 3000).ConfigureAwait(false);
+                if (response.Bool("ok") == true || response.Str("errorCode") is "lease_expired" or "stale_lease")
+                {
+                    _leaseToken = null;
+                    Log.Info("released the desktop lease as the MCP session ended");
+                    return;
+                }
+                if (response.Str("errorCode") != "seat_busy") break;
+                await Task.Delay(500).ConfigureAwait(false);
+            }
+            Log.Warn("could not release the desktop lease as the MCP session ended; it expires on its own");
+        }
+        catch (Exception ex) { Log.Warn($"could not release the desktop lease as the MCP session ended: {ex.Message}"); }
+    }
+
+    internal async Task<JsonObject> CallAsync(string toolName, JsonObject arguments, CancellationToken cancel)
+    {
+        if (!Tools.TryResolve(toolName, out string op, out bool startsDaemon))
+            return TextResult($"Unknown tool '{toolName}'.", isError: true);
+
+        if (toolName == "anode_guide") return TextResult(AgentGuide.Text);
+        if (Tools.ValidateArguments(toolName, arguments) is { } invalid) return TextResult(invalid, true);
+        if (toolName == "seat_stop") return await StopAsync(arguments, cancel).ConfigureAwait(false);
+        string? leaseAction = toolName == "seat_lease" ? arguments.Str("action") ?? "status" : null;
+        if (leaseAction == "acquire")
+        {
+            _layeredLaunchCount = arguments.Str("mode") == "layered" ? arguments.Int("layerCount") ?? 2 : 0;
+            _leaseTtlSeconds = arguments.Int("ttlSeconds");
+        }
+        bool leaseGated = AgentAccess.RequiresLease(op);
+        // A missing lease for a desktop tool is taken below when the desktop is free; everything
+        // else is checked before any daemon starts.
+        bool takesLease = leaseGated && _leaseToken is null;
+        var payload = Envelope(arguments, leaseAction);
+        payload["op"] = op;
+        if (!takesLease && AgentAccess.Validate(payload) is { } invalidOwner) return TextResult(invalidOwner, true);
+        payload.Remove("op");
+        // Only an explicit start or lease acquisition may create a seat. A cached token must not
+        // relaunch a daemon the user quit, only for the new seat to refuse that token.
+        bool mayStart = (startsDaemon && !leaseGated) || leaseAction == "acquire";
+        var client = await DaemonAsync(mayStart, cancel).ConfigureAwait(false);
+        if (client is null)
+        {
+            if (mayStart)
+                return TextResult(_seatTaken ?? (_blockedReason is not null
+                    ? _blockedReason + " Tell the user to run `anode setup` in a terminal and approve the administrator prompt; "
+                      + "this cannot be done from here."
+                    : $"{Brand.Name} is not running and could not be started. Run `{Brand.Command} doctor` in a terminal to see why."), isError: true);
+            return Unavailable(toolName, leaseAction, leaseGated, daemonRunning: false);
+        }
+
+        string? note = null;
+        if (takesLease)
+        {
+            if (await TakeLeaseAsync(client, toolName, cancel).ConfigureAwait(false) is { } refused) return refused;
+            _lookPending = true;
+            note = TookLease;
+            payload = Envelope(arguments, leaseAction);
+        }
+        // Input aimed by an earlier look could land on whatever another agent left on screen. That holds
+        // for every input until the agent looks again, not only the call that took the lease: a client
+        // may already have sent the next keys.
+        if (_lookPending && Tools.ActsOnScreen(op)) return TextResult(LookFirst, isError: true);
+
+        int timeout = toolName is "steam_launch" or "seat_start" or "seat_display" or "android_emulator" ? 180_000 : 60_000;
+        // The daemon gives the seat 60 seconds unless told otherwise; Steam may first have to start on the desktop,
+        // a display change Windows does not make live reconnects the viewer, and an emulator takes minutes to boot.
+        if (toolName is "steam_launch" or "seat_display" or "android_emulator") payload["timeoutMs"] = timeout - 5_000;
+        var response = leaseAction == "acquire"
+            ? await AcquireInLineAsync(client, payload, arguments.Int("waitSeconds") ?? DefaultWaitSeconds, cancel).ConfigureAwait(false)
+            : await client.RequestAsync(op, payload, timeout, cancel).ConfigureAwait(false);
+
+        if (response.Bool("ok") != true)
+        {
+            // Anode quit since the previous call. Report that rather than a lost connection; the
+            // request is never resent, and the agent observes again after acquiring.
+            if (!client.IsConnected && !mayStart && await DaemonAsync(mayStart: false, cancel).ConfigureAwait(false) is null)
+            {
+                var unavailable = Unavailable(toolName, leaseAction, leaseGated, daemonRunning: false);
+                unavailable["structuredContent"] = response.DeepClone();
+                return unavailable;
+            }
+            // A person stopped the seat while Anode kept running.
+            if (response.Str("errorCode") == "seat_stopped")
+                return Unavailable(toolName, leaseAction, leaseGated, daemonRunning: true);
+            if (response.Str("errorCode") is "lease_expired" or "stale_lease") DropLease();
+            if (response.Bool("started") == true || response.Str("errorCode") is "seat_detached" or "connection_lost")
+                _lookPending = true;
+            var error = TextResult(response.Str("error") ?? "The request failed.", isError: true);
+            error["structuredContent"] = response.DeepClone();
+            return error;
+        }
+
+        var result = response.Obj("result");
+        if (Tools.Looks(op, arguments, result)) _lookPending = false;
+        // A launch, window or job call that took the lease ran at once; say what it holds back.
+        else if (takesLease) note += " " + LookBeforeInput;
+        if (leaseAction is "acquire" or "renew")
+        {
+            string? token = result?.Str("leaseToken");
+            // A new token means the lease this agent held ended, though no call told it so.
+            if (_leaseToken is not null && token != _leaseToken) _lookPending = true;
+            _leaseToken = token;
+        }
+        if (leaseAction == "release") DropLease();
+        if (toolName == "seat_status" && result is not null)
+        {
+            result["agentId"] = _agentId;
+            result["agentName"] = _agentName;
+        }
+        // Someone is waiting: say so, so a finished agent hands the desktop on instead of letting it expire.
+        if (response.Int("waitingAgents") is int waiting and > 0)
+            note = (note is null ? "" : note + " ") + (waiting == 1 ? "Another agent is" : $"{waiting} other agents are")
+                + " waiting for the desktop; release it with seat_lease action=release when you finish.";
+        return WithNote(Present(toolName, result, _protocol), note);
+    }
+
+    /// <summary>Forgets an ended lease. The desktop may change hands before the next one, so input then waits for a look.</summary>
+    private void DropLease()
+    {
+        if (_leaseToken is not null) _lookPending = true;
+        _leaseToken = null;
+    }
+
+    private JsonObject Envelope(JsonObject arguments, string? leaseAction)
+    {
+        var payload = AgentAccess.Attach(arguments, _agentId, _leaseToken);
+        if (leaseAction is not null && _agentName is not null) payload["agentName"] = _agentName;
+        if (_ephemeral && leaseAction is "acquire" or "renew")
+        {
+            using var process = Process.GetCurrentProcess();
+            payload["clientPid"] = process.Id;
+            payload["clientStarted"] = process.StartTime.ToUniversalTime().ToFileTimeUtc();
+        }
+        return payload;
+    }
+
+    /// <summary>
+    /// Takes the lease for a desktop tool when the desktop is free, so an agent working alone never
+    /// manages it. It never starts a seat and never jumps the line: a busy desktop is reported.
+    /// </summary>
+    private async Task<JsonObject?> TakeLeaseAsync(JsonPipeClient client, string toolName, CancellationToken cancel)
+    {
+        var request = Envelope(new JsonObject { ["action"] = "acquire" }, "acquire");
+        if (_layeredLaunchCount > 0)
+        {
+            request["mode"] = "layered";
+            request["layerCount"] = _layeredLaunchCount;
+        }
+        if (_leaseTtlSeconds is int ttl) request["ttlSeconds"] = ttl;
+        request["startSeat"] = false;
+        var response = await client.RequestAsync("lease", request, 30_000, cancel).ConfigureAwait(false);
+        if (response.Bool("ok") == true && response.Obj("result")?.Str("leaseToken") is { } token)
+        {
+            _leaseToken = token;
+            return null;
+        }
+        if (!client.IsConnected && await DaemonAsync(mayStart: false, cancel).ConfigureAwait(false) is null)
+            return Unavailable(toolName, null, leaseGated: true, daemonRunning: false);
+        if (response.Str("errorCode") == "seat_stopped") return TextResult(SeatStopped, isError: true);
+        var error = TextResult(response.Str("error") ?? $"{Brand.Name} could not take the desktop lease.", isError: true);
+        error["structuredContent"] = response.DeepClone();
+        return error;
+    }
+
+    /// <summary>
+    /// Asks for the desktop about once a second until it is granted or the wait ends. Each ask keeps
+    /// this agent's place in line; a place is dropped soon after the asking stops, so the desktop is
+    /// never handed to an agent that gave up or went away.
+    /// </summary>
+    private static async Task<JsonObject> AcquireInLineAsync(JsonPipeClient client, JsonObject payload, int waitSeconds, CancellationToken cancel)
+    {
+        var waited = Stopwatch.StartNew();
+        while (true)
+        {
+            int left = waitSeconds - (int)waited.Elapsed.TotalSeconds;
+            payload["waitSeconds"] = Math.Max(0, left);
+            // Acquisition may start the seat first.
+            int budget = 180_000 + waitSeconds * 1000 - (int)waited.ElapsedMilliseconds;
+            if (budget <= 0) return JsonPipeClient.Failure("timed_out", "Lease acquisition did not finish.", false);
+            var response = await client.RequestAsync("lease", payload, Math.Min(180_000, budget), cancel).ConfigureAwait(false);
+            if (response.Bool("ok") == true || response.Str("errorCode") != "seat_busy" || left <= 0 || !client.IsConnected) return response;
+            await Task.Delay(1000, cancel).ConfigureAwait(false);
+        }
+    }
+
+    private static JsonObject WithNote(JsonObject toolResult, string? note)
+    {
+        if (note is null || toolResult["content"] is not JsonArray content) return toolResult;
+        if (content.OfType<JsonObject>().FirstOrDefault(block => block.Str("type") == "text") is { } text)
+            text["text"] = text.Str("text") + "\n" + note;
+        else content.Add(new JsonObject { ["type"] = "text", ["text"] = note });
+        return toolResult;
+    }
+
+    private static JsonObject Present(string toolName, JsonObject? result, string protocol)
+    {
+        if (toolName == "seat_audio_listen" && result?.Str("data") is { } audio)
+        {
+            var metadata = (JsonObject)result.DeepClone();
+            metadata.Remove("data");
+            string mimeType = result.Str("mimeType") ?? "audio/wav";
+            // MCP added audio content in 2025-03-26 (versions are dates, so ordinal order is release order).
+            // An earlier client would reject the whole result; an embedded resource carries the same WAV in every version.
+            var media = string.CompareOrdinal(protocol, "2025-03-26") >= 0
+                ? new JsonObject { ["type"] = "audio", ["mimeType"] = mimeType, ["data"] = audio }
+                : new JsonObject { ["type"] = "resource", ["resource"] = new JsonObject
+                    { ["uri"] = $"anode://seat/audio/{Guid.NewGuid():N}.wav", ["mimeType"] = mimeType, ["blob"] = audio } };
+            // As with images, don't let clients choosing structuredContent discard the media.
+            return new JsonObject { ["content"] = new JsonArray(
+                media, new JsonObject { ["type"] = "text", ["text"] = metadata.ToJsonString() }) };
+        }
+        if (result?.Str("summary") is { } summary)
+        {
+            var block = new JsonObject { ["type"] = "text", ["text"] = summary };
+            // Clients that prefer structuredContent would otherwise receive the summary and its data twice.
+            var structured = (JsonObject)result.DeepClone();
+            structured.Remove("summary");
+            if (structured.Obj("screenshot") is { } screenshot && screenshot.Str("data") is { } image)
+            {
+                // Some clients read only structuredContent when it is present and would drop the image.
+                // The summary carries the capture size, automation IDs and bounds instead. A daemon from
+                // an older release omits them, so rebuild its observation text here.
+                if (!summary.Contains("(captured at ", StringComparison.Ordinal))
+                    block["text"] = result["elements"] is JsonArray ? DesktopPresentation.Summary(result)
+                        : DesktopPresentation.Capture(screenshot) is { } capture ? summary + "\n" + capture : summary;
+                return new JsonObject
+                {
+                    ["content"] = new JsonArray(block,
+                        new JsonObject { ["type"] = "image", ["data"] = image, ["mimeType"] = screenshot.Str("mimeType") ?? "image/png" })
+                };
+            }
+            return new JsonObject { ["content"] = new JsonArray(block), ["structuredContent"] = structured };
+        }
+
+        // A screenshot comes back as an image block so the model can actually look at it.
+        if (toolName == "seat_screenshot" && result?.Str("data") is { } base64)
+        {
+            return new JsonObject
+            {
+                ["content"] = new JsonArray(
+                    new JsonObject
+                    {
+                        ["type"] = "image",
+                        ["data"] = base64,
+                        ["mimeType"] = result.Str("mimeType") ?? "image/png"
+                    },
+                    new JsonObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = $"Seat screen, {result.Int("width")}x{result.Int("height")} "
+                                 + $"(captured at {result.Int("sourceWidth")}x{result.Int("sourceHeight")}). "
+                                 + "Click coordinates use the captured size, not the scaled image."
+                    })
+            };
+        }
+
+        string text = result is null || result.Count == 0
+            ? "ok"
+            : result.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        return TextResult(text);
+    }
+
+    /// <summary>
+    /// The answer when no seat can serve a call: Anode is not running, or a person stopped the seat
+    /// while Anode kept running. Either way the lease is gone. Diagnostics report this as an
+    /// observation and nothing starts a seat.
+    /// </summary>
+    private JsonObject Unavailable(string toolName, string? leaseAction, bool leaseGated, bool daemonRunning)
+    {
+        if (leaseGated || leaseAction is "renew" or "release") DropLease();
+        if (leaseGated || leaseAction == "renew") return TextResult(daemonRunning ? SeatStoppedLease : LeaseEnded, isError: true);
+        if (leaseAction == "release")
+            return TextResult(daemonRunning ? "The seat is stopped, so there is no desktop lease to release."
+                : $"{Brand.Name} is not running, so there is no desktop lease to release.");
+        if (leaseAction == "status" || toolName is "seat_status" or "seat_capabilities" or "seat_processes" or "steam_status" or "seat_audio_status" or "android_status")
+        {
+            var status = new JsonObject
+            {
+                ["state"] = "stopped", ["daemonRunning"] = daemonRunning, ["agentId"] = _agentId,
+                ["ownerAgentId"] = null, ["summary"] = daemonRunning ? SeatStopped : NotRunning
+            };
+            var reply = TextResult(status.ToJsonString());
+            reply["structuredContent"] = status;
+            return reply;
+        }
+        return TextResult(daemonRunning ? SeatStopped : NotRunning, isError: true);
+    }
+
+    private async Task<JsonPipeClient?> DaemonAsync(bool mayStart, CancellationToken cancel)
+    {
+        if (_daemon is { IsConnected: true }) return _daemon;
+
+        await ConnectGate.WaitAsync(cancel).ConfigureAwait(false);
+        try
+        {
+            if (_daemon is { IsConnected: true }) return _daemon;
+            _daemon?.Dispose();
+            // Injected private pipes have no daemon mutex; their stand-in server may still be starting.
+            _daemon = _controlPipe == Env.ControlPipe
+                ? await DaemonLauncher.ConnectExistingAsync(ConnectTimeoutMs, cancel).ConfigureAwait(false)
+                : await JsonPipeClient.TryConnectAsync(_controlPipe, ConnectTimeoutMs, cancel).ConfigureAwait(false);
+            if (_daemon is not null || !mayStart) return _daemon;
+
+            _seatTaken = null;
+            if (_blockingSummary() is { } blocked)
+            {
+                Log.Warn($"not starting a daemon: {blocked}");
+                _blockedReason = blocked;
+                return null;
+            }
+
+            _blockedReason = null;
+            Log.Info("no daemon; starting one");
+            cancel.ThrowIfCancellationRequested();
+            _launchPending = true;
+            try { _launchDaemon(); }
+            catch (SeatTakenException ex)
+            {
+                _launchPending = false;
+                Log.Warn($"not starting a daemon: {ex.Message}");
+                _seatTaken = ex.Message;
+                return null;
+            }
+            catch { _launchPending = false; throw; }
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(40);
+            while (DateTime.UtcNow < deadline && _daemon is null)
+            {
+                _daemon = await JsonPipeClient.TryConnectAsync(_controlPipe, 500, cancel).ConfigureAwait(false);
+                if (_daemon is null) await Task.Delay(50, cancel).ConfigureAwait(false);
+            }
+
+            if (_daemon is null) return null;
+            _launchPending = false;
+
+            // Let the seat finish signing in, so the agent's first real call does not
+            // land on a session that is still starting Explorer.
+            await SeatStartup.WaitAsync(_daemon, cancel).ConfigureAwait(false);
+
+            return _daemon;
+        }
+        finally
+        {
+            ConnectGate.Release();
+        }
+    }
+
+    private async Task<JsonObject> StopAsync(JsonObject arguments, CancellationToken cancel)
+    {
+        // McpSession cancels normal requests first. Wait for any scheduler hand-off
+        // to finish, then use a separate connection so Stop bypasses busy pipe I/O.
+        await ConnectGate.WaitAsync(cancel).ConfigureAwait(false);
+        try
+        {
+            int waitMs = _launchPending ? 40_000 : 1000;
+            using var client = await JsonPipeClient.TryConnectAsync(_controlPipe, waitMs, cancel).ConfigureAwait(false);
+            if (client is null)
+                return TextResult(_launchPending
+                    ? "The daemon was launched but did not answer Stop. Run `anode status` and `anode kill` to check it."
+                    : $"{Brand.Name} is not running; there is no seat to stop.", _launchPending);
+            _launchPending = false;
+            var response = await client.RequestAsync("seat.stop", arguments, 60_000, cancel).ConfigureAwait(false);
+            if (response.Bool("ok") == true) DropLease();
+            return response.Bool("ok") == true
+                ? TextResult(response.Obj("result")?.ToJsonString() ?? "ok")
+                : TextResult(response.Str("error") ?? "Could not stop the seat.", true);
+        }
+        finally { ConnectGate.Release(); }
+    }
+
+    private static JsonObject TextResult(string text, bool isError = false) => McpSession.TextResult(text, isError);
+
+    public void Dispose() => _daemon?.Dispose();
+}

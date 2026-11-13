@@ -1,0 +1,489 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.Json.Nodes;
+
+namespace Anode.Core.Input;
+
+/// <summary>
+/// Keyboard and mouse injection with <c>SendInput</c>.
+///
+/// The isolation the whole project is built around lives here: this code only ever
+/// runs inside the seat host, which lives inside the child session. <c>SendInput</c>
+/// posts to the calling process's own session input queue, so it moves the seat's
+/// pointer and types into the seat's focused window. The parent session's pointer,
+/// focus and foreground window are untouched. There is no cross-session injection
+/// anywhere in Anode, by construction.
+///
+/// Keys go in as scan codes by default, because games commonly read raw input or
+/// DirectInput and ignore virtual-key-only synthetic events.
+/// </summary>
+internal static class InputInjector
+{
+    // ----------------------------------------------------------------- interop
+
+    private const int InputMouse = 0;
+    private const int InputKeyboard = 1;
+
+    private const uint MouseEventMove = 0x0001;
+    private const uint MouseEventLeftDown = 0x0002;
+    private const uint MouseEventLeftUp = 0x0004;
+    private const uint MouseEventRightDown = 0x0008;
+    private const uint MouseEventRightUp = 0x0010;
+    private const uint MouseEventMiddleDown = 0x0020;
+    private const uint MouseEventMiddleUp = 0x0040;
+    private const uint MouseEventXDown = 0x0080;
+    private const uint MouseEventXUp = 0x0100;
+    private const uint MouseEventWheel = 0x0800;
+    private const uint MouseEventHWheel = 0x1000;
+    private const uint MouseEventAbsolute = 0x8000;
+
+    private const uint KeyEventExtended = 0x0001;
+    private const uint KeyEventKeyUp = 0x0002;
+    private const uint KeyEventUnicode = 0x0004;
+    private const uint KeyEventScanCode = 0x0008;
+
+    private const uint MapVkToVsc = 0;
+    private const int WheelDelta = 120;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MouseInput
+    {
+        public int Dx, Dy;
+        public uint MouseData, Flags, Time;
+        public IntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KeyboardInput
+    {
+        public ushort Vk, Scan;
+        public uint Flags, Time;
+        public IntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HardwareInput
+    {
+        public uint Msg;
+        public ushort ParamL, ParamH;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public MouseInput Mouse;
+        [FieldOffset(0)] public KeyboardInput Keyboard;
+        [FieldOffset(0)] public HardwareInput Hardware;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Input
+    {
+        public int Type;
+        public InputUnion Union;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint count, [In] Input[] inputs, int size);
+
+    [DllImport("user32.dll")]
+    private static extern uint MapVirtualKey(uint code, uint mapType);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out System.Drawing.Point point);
+
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int index);
+
+    // --------------------------------------------------------------- geometry
+
+    /// <summary>Size of the seat's desktop, in pixels.</summary>
+    public static System.Drawing.Size ScreenSize()
+    {
+        int width = GetSystemMetrics(0);
+        int height = GetSystemMetrics(1);
+        if (width > 0 && height > 0) return new System.Drawing.Size(width, height);
+        var bounds = Screen.PrimaryScreen?.Bounds ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
+        return bounds.Size;
+    }
+
+    public static System.Drawing.Point CursorPosition() =>
+        GetCursorPos(out var point) ? point : System.Drawing.Point.Empty;
+
+    // ------------------------------------------------------------------ mouse
+
+    private static void Send(params Input[] inputs)
+    {
+        uint sent = SendCounted(inputs, out string? blocked);
+        if (blocked is not null) throw new InvalidOperationException(blocked);
+        if (sent != inputs.Length)
+            throw Native.Native.LastError($"SendInput accepted {sent} of {inputs.Length} events");
+    }
+
+    /// <summary>Sends the events unless the seat's input is blocked, and returns how many Windows accepted.</summary>
+    private static uint SendCounted(Input[] inputs, out string? blocked)
+    {
+        blocked = Desktop.WindowAccess.InputBlockReason();
+        return blocked is null ? SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) : 0;
+    }
+
+    /// <summary>
+    /// Sends one step of typing. A refusal says whether part of the step went out: an earlier part, or some of these
+    /// events. Windows may not report every refusal, though: input an elevated window doesn't take may be dropped
+    /// without an error.
+    /// </summary>
+    private static void TypingStep(Input[] events, bool earlierPartSent)
+    {
+        uint sent = SendCounted(events, out string? blocked);
+        if (blocked is not null) throw new TextTyping.Refused(blocked, earlierPartSent);
+        if (sent != events.Length)
+            throw new TextTyping.Refused(Native.Native.LastError($"SendInput accepted {sent} of {events.Length} events").Message,
+                earlierPartSent || sent > 0);
+    }
+
+    private static Input AbsoluteMove(int x, int y)
+    {
+        var size = ScreenSize();
+        int nx = (int)Math.Round(Math.Clamp(x, 0, size.Width - 1) * 65535.0 / Math.Max(1, size.Width - 1));
+        int ny = (int)Math.Round(Math.Clamp(y, 0, size.Height - 1) * 65535.0 / Math.Max(1, size.Height - 1));
+        return new Input
+        {
+            Type = InputMouse,
+            Union = { Mouse = new MouseInput { Dx = nx, Dy = ny, Flags = MouseEventMove | MouseEventAbsolute } }
+        };
+    }
+
+    public static void MoveTo(int x, int y) => Send(AbsoluteMove(x, y));
+
+    public static void MoveBy(int dx, int dy) => Send(new Input
+    {
+        Type = InputMouse,
+        Union = { Mouse = new MouseInput { Dx = dx, Dy = dy, Flags = MouseEventMove } }
+    });
+
+    private static (uint Down, uint Up, uint Data) ButtonFlags(string button) => button.ToLowerInvariant() switch
+    {
+        "left" or "l" or "" => (MouseEventLeftDown, MouseEventLeftUp, 0u),
+        "right" or "r" => (MouseEventRightDown, MouseEventRightUp, 0u),
+        "middle" or "m" => (MouseEventMiddleDown, MouseEventMiddleUp, 0u),
+        "x1" or "back" => (MouseEventXDown, MouseEventXUp, 1u),
+        "x2" or "forward" => (MouseEventXDown, MouseEventXUp, 2u),
+        _ => throw new ArgumentException($"Unknown mouse button '{button}'. Use left, right, middle, x1 or x2.")
+    };
+
+    public static void MouseDown(string button, int? x = null, int? y = null)
+    {
+        var (down, up, data) = ButtonFlags(button);
+        var events = new List<Input>();
+        if (x.HasValue && y.HasValue) events.Add(AbsoluteMove(x.Value, y.Value));
+        events.Add(new Input { Type = InputMouse, Union = { Mouse = new MouseInput { Flags = down, MouseData = data } } });
+        HeldMouse.Add((up, data));
+        Send(events.ToArray());
+    }
+
+    public static void MouseUp(string button, int? x = null, int? y = null)
+    {
+        var (_, up, data) = ButtonFlags(button);
+        var events = new List<Input>();
+        if (x.HasValue && y.HasValue) events.Add(AbsoluteMove(x.Value, y.Value));
+        events.Add(new Input { Type = InputMouse, Union = { Mouse = new MouseInput { Flags = up, MouseData = data } } });
+        Send(events.ToArray());
+        HeldMouse.Remove((up, data));
+    }
+
+    public static void Click(string button = "left", int? x = null, int? y = null, int count = 1, int holdMs = 20,
+        CancellationToken cancel = default, Func<bool>? ownsTarget = null)
+    {
+        for (int i = 0; i < Math.Max(1, count); i++)
+        {
+            cancel.ThrowIfCancellationRequested();
+            if (ownsTarget is not null && !ownsTarget()) throw new InvalidOperationException("The click target changed. Inspect before acting again.");
+            MouseDown(button, x, y);
+            try { if (Hold(holdMs, cancel)) cancel.ThrowIfCancellationRequested(); }
+            finally { MouseUp(button); }
+            if (i + 1 < count && Hold(40, cancel)) cancel.ThrowIfCancellationRequested();
+        }
+    }
+
+    public static void Scroll(int notches, bool horizontal = false) => Send(new Input
+    {
+        Type = InputMouse,
+        Union =
+        {
+            Mouse = new MouseInput
+            {
+                MouseData = unchecked((uint)(notches * WheelDelta)),
+                Flags = horizontal ? MouseEventHWheel : MouseEventWheel
+            }
+        }
+    });
+
+    public static void Drag(int fromX, int fromY, int toX, int toY, string button = "left", int steps = 24, int stepMs = 8,
+        CancellationToken cancel = default, Func<bool>? ownsFocus = null, Func<Point, bool>? ownsPoint = null)
+    {
+        cancel.ThrowIfCancellationRequested();
+        if (ownsPoint is not null && !ownsPoint(new Point(fromX, fromY)))
+            throw new InvalidOperationException("The drag start is no longer over the selected window.");
+        MouseDown(button, fromX, fromY);
+        try
+        {
+            steps = Math.Max(1, steps);
+            for (int i = 1; i <= steps; i++)
+            {
+                cancel.ThrowIfCancellationRequested();
+                if (ownsFocus is not null && !ownsFocus()) throw new InvalidOperationException("The drag target lost focus. Inspect before acting again.");
+                int x = fromX + (toX - fromX) * i / steps;
+                int y = fromY + (toY - fromY) * i / steps;
+                if (ownsPoint is not null && !ownsPoint(new Point(x, y)))
+                    throw new InvalidOperationException("The drag crossed another window. Inspect before acting again.");
+                MoveTo(x, y);
+                if (Hold(stepMs, cancel)) cancel.ThrowIfCancellationRequested();
+            }
+        }
+        finally
+        {
+            MouseUp(button);
+        }
+    }
+
+    // --------------------------------------------------------------- keyboard
+
+    private static Input KeyEvent(ushort vk, bool up, bool useScanCode)
+    {
+        ushort scan = (ushort)MapVirtualKey(vk, MapVkToVsc);
+        uint flags = up ? KeyEventKeyUp : 0;
+        if (IsExtendedKey(vk)) flags |= KeyEventExtended;
+
+        if (useScanCode && scan != 0)
+        {
+            flags |= KeyEventScanCode;
+            return new Input { Type = InputKeyboard, Union = { Keyboard = new KeyboardInput { Vk = 0, Scan = scan, Flags = flags } } };
+        }
+
+        return new Input { Type = InputKeyboard, Union = { Keyboard = new KeyboardInput { Vk = vk, Scan = scan, Flags = flags } } };
+    }
+
+    private static readonly HashSet<(uint Up, uint Data)> HeldMouse = new();
+    private static readonly HashSet<(ushort Key, bool Scan)> HeldKeys = new();
+
+    public static void KeyDown(string key, bool useScanCode = true)
+    {
+        ushort vk = KeyCodes.Resolve(key);
+        HeldKeys.Add((vk, useScanCode));
+        Send(KeyEvent(vk, false, useScanCode));
+    }
+
+    public static void KeyUp(string key, bool useScanCode = true)
+    {
+        ushort vk = KeyCodes.Resolve(key);
+        Send(KeyEvent(vk, true, useScanCode));
+        HeldKeys.Remove((vk, useScanCode));
+    }
+
+    /// <summary>Release only input issued by this host, under the desktop ownership gate.</summary>
+    public static void ReleaseHeld()
+    {
+        foreach (var button in HeldMouse.ToArray())
+        {
+            Send(new Input { Type = InputMouse, Union = { Mouse = new MouseInput { Flags = button.Up, MouseData = button.Data } } });
+            HeldMouse.Remove(button);
+        }
+        foreach (var key in HeldKeys.ToArray())
+        {
+            Send(KeyEvent(key.Key, true, key.Scan));
+            HeldKeys.Remove(key);
+        }
+    }
+
+    /// <summary>
+    /// Presses a chord such as <c>ctrl+shift+esc</c> or a single key such as <c>f5</c>,
+    /// holding it for <paramref name="holdMs"/> and releasing in reverse order.
+    /// </summary>
+    public static void Press(string chord, int holdMs = 40, bool useScanCode = true, CancellationToken cancel = default) =>
+        Press(KeyCodes.Chord(chord), holdMs, cancel, (keys, up) => Send(keys.Select(vk => KeyEvent(vk, up, useScanCode)).ToArray()),
+            useScanCode);
+
+    /// <summary>
+    /// The hold ends early when <paramref name="cancel"/> fires (the request's deadline, or a stopping seat): the keys
+    /// are released and the press throws, so its reply still reaches the caller in time and its connection survives.
+    /// </summary>
+    internal static void Press(ushort[] keys, int holdMs, CancellationToken cancel, Action<ushort[], bool> send, bool useScanCode = true)
+    {
+        // A request whose time already ran out presses nothing.
+        cancel.ThrowIfCancellationRequested();
+        foreach (ushort key in keys) HeldKeys.Add((key, useScanCode));
+        bool cut;
+        try { send(keys, false); cut = Hold(holdMs, cancel); }
+        finally
+        {
+            send(keys.Reverse().ToArray(), true);
+            foreach (ushort key in keys) HeldKeys.Remove((key, useScanCode));
+        }
+        if (cut) throw new OperationCanceledException(cancel);
+    }
+
+    /// <summary>Waits <paramref name="ms"/> (at least 1 ms); true when <paramref name="cancel"/> ended the wait first.</summary>
+    internal static bool Hold(int ms, CancellationToken cancel) => cancel.WaitHandle.WaitOne(Math.Max(1, ms));
+
+    /// <summary>
+    /// Types literal text as Unicode, so layout and dead keys do not interfere. <see cref="TextTyping"/> paces it so
+    /// the focused program keeps up, and says how far it got when it can't.
+    /// </summary>
+    public static JsonObject TypeText(string text, int? perCharMs, int timeoutMs, CancellationToken cancel, Func<bool>? ownsFocus = null)
+    {
+        using var timer = new TextTyping.PreciseTimer();
+        var clock = Stopwatch.StartNew();
+        return TextTyping.Type(text, perCharMs, new TextTyping.Typist
+        {
+            Send = unit =>
+            {
+                if (ownsFocus is not null && !ownsFocus()) throw new InvalidOperationException("Layer focus changed during typing. Input stopped; inspect the actual text before continuing.");
+                TypeUnit(unit, timer.Wait);
+            },
+            Responsive = TextTyping.FocusResponsive,
+            Wait = timer.Wait,
+            Now = () => clock.Elapsed.TotalMilliseconds,
+            Cancel = cancel
+        }, timeoutMs);
+    }
+
+    private static void TypeUnit(TextTyping.Unit unit, Action<double> wait)
+    {
+        if (unit.Key is { } key)
+        {
+            // As Press does, with the hold timed precisely.
+            ushort vk = KeyCodes.Resolve(key);
+            HeldKeys.Add((vk, true));
+            bool pressed = false;
+            try { TypingStep([KeyEvent(vk, false, true)], false); pressed = true; wait(TextTyping.KeyHoldMs); }
+            finally
+            {
+                TypingStep([KeyEvent(vk, true, true)], pressed);
+                HeldKeys.Remove((vk, true));
+            }
+            return;
+        }
+        // A surrogate pair goes out in one call, so nothing lands between its halves.
+        var events = new List<Input>(unit.Text.Length * 2);
+        foreach (char character in unit.Text)
+        {
+            events.Add(new Input { Type = InputKeyboard, Union = { Keyboard = new KeyboardInput { Scan = character, Flags = KeyEventUnicode } } });
+            events.Add(new Input { Type = InputKeyboard, Union = { Keyboard = new KeyboardInput { Scan = character, Flags = KeyEventUnicode | KeyEventKeyUp } } });
+        }
+        TypingStep(events.ToArray(), false);
+    }
+
+    private static bool IsExtendedKey(ushort vk) => vk switch
+    {
+        0x21 or 0x22 or 0x23 or 0x24 => true,             // PageUp PageDown End Home
+        0x25 or 0x26 or 0x27 or 0x28 => true,             // arrows
+        0x2D or 0x2E => true,                             // Insert Delete
+        0x2C => true,                                     // PrintScreen
+        0x90 => true,                                     // NumLock
+        0x6F => true,                                     // Divide
+        0xA3 or 0xA5 => true,                             // RControl RMenu
+        0x5B or 0x5C or 0x5D => true,                     // LWin RWin Apps
+        _ => false
+    };
+}
+
+/// <summary>Key names an agent might reasonably type, mapped to virtual-key codes.</summary>
+internal static class KeyCodes
+{
+    private static readonly Dictionary<string, ushort> Map = Build();
+
+    public static ushort Resolve(string name) => TryResolve(name, out ushort vk) ? vk : throw new ArgumentException(Unknown(name));
+
+    /// <summary>
+    /// The keys of a chord such as <c>ctrl+shift+esc</c>. An empty part is refused, not dropped:
+    /// <c>ctrl++</c> used to press ctrl alone and report success.
+    /// </summary>
+    public static ushort[] Chord(string chord) => ChordProblem(chord) is { } problem
+        ? throw new ArgumentException(problem)
+        : chord.Split('+', StringSplitOptions.TrimEntries).Select(Resolve).ToArray();
+
+    /// <summary>Why a chord can't be pressed, or null. MCP, the daemon and the CLI ask before anything reaches the seat.</summary>
+    public static string? ChordProblem(string chord)
+    {
+        string[] names = chord.Split('+', StringSplitOptions.TrimEntries);
+        if (names.All(name => name.Length == 0)) return "No key was given.";
+        if (names.Any(name => name.Length == 0))
+            return $"'{Clip(chord)}' has an empty key between its + signs. Join keys with +, and name the plus key 'plus', as in ctrl+plus.";
+        return names.FirstOrDefault(name => !TryResolve(name, out _)) is { } unknown ? Unknown(unknown) : null;
+    }
+
+    private static bool TryResolve(string name, out ushort vk)
+    {
+        string key = name.Trim().ToLowerInvariant();
+        // Windows' constant names (VK_OEM_3, VK_RETURN) name a key after the prefix; vk<hex> below is a code.
+        bool constant = key.Length > 3 && key.StartsWith("vk_", StringComparison.Ordinal);
+        if (constant) key = key[3..];
+        // VK_OEM_PLUS, page_up and caps-lock spell the names below with separators.
+        if (key.Length > 1) key = key.Replace("_", "").Replace("-", "");
+        if (Map.TryGetValue(key, out vk)) return true;
+        if (!constant && key.Length > 2 && key.StartsWith("vk", StringComparison.Ordinal)
+            && ushort.TryParse(key[2..], System.Globalization.NumberStyles.HexNumber, null, out ushort raw) && raw is > 0 and < 0xFF)
+        {
+            vk = raw;
+            return true;
+        }
+        return false;
+    }
+
+    private static string Clip(string text) => text.Length > 40 ? text[..40] + "..." : text;
+
+    private static string Unknown(string name) =>
+        $"Unknown key '{Clip(name.Trim())}'. Use a letter, a digit, f1-f24, num0-num9, a name such as enter, esc, space, tab, "
+        + "backspace, del, home, pgup, up, ctrl, alt, shift or win, a punctuation key by its symbol or name (` grave, - minus, "
+        + "= equals, [ lbracket, ] rbracket, \\ backslash, ; semicolon, ' quote, , comma, . period, / slash), "
+        + "a Windows name such as VK_OEM_3, or vk<hex> such as vkC0.";
+
+    private static Dictionary<string, ushort> Build()
+    {
+        var map = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["backspace"] = 0x08, ["back"] = 0x08, ["tab"] = 0x09,
+            ["clear"] = 0x0C, ["enter"] = 0x0D, ["return"] = 0x0D,
+            ["shift"] = 0xA0, ["lshift"] = 0xA0, ["rshift"] = 0xA1,
+            ["ctrl"] = 0xA2, ["control"] = 0xA2, ["lctrl"] = 0xA2, ["rctrl"] = 0xA3,
+            ["alt"] = 0xA4, ["lalt"] = 0xA4, ["ralt"] = 0xA5, ["menu"] = 0xA4,
+            ["pause"] = 0x13, ["capslock"] = 0x14, ["caps"] = 0x14,
+            ["esc"] = 0x1B, ["escape"] = 0x1B, ["space"] = 0x20, [" "] = 0x20,
+            ["pageup"] = 0x21, ["pgup"] = 0x21, ["pagedown"] = 0x22, ["pgdn"] = 0x22,
+            ["end"] = 0x23, ["home"] = 0x24,
+            ["left"] = 0x25, ["up"] = 0x26, ["right"] = 0x27, ["down"] = 0x28,
+            ["printscreen"] = 0x2C, ["prtsc"] = 0x2C,
+            ["insert"] = 0x2D, ["ins"] = 0x2D, ["delete"] = 0x2E, ["del"] = 0x2E,
+            ["win"] = 0x5B, ["lwin"] = 0x5B, ["rwin"] = 0x5C, ["apps"] = 0x5D, ["menukey"] = 0x5D,
+            ["numlock"] = 0x90, ["scrolllock"] = 0x91,
+            ["multiply"] = 0x6A, ["add"] = 0x6B, ["subtract"] = 0x6D,
+            ["decimal"] = 0x6E, ["divide"] = 0x6F,
+            // The punctuation keys of a US layout, with the names agents try first: Windows' VK_OEM_n and .NET's
+            // Keys.OemXxx (VK_OEM_3 is the ` key) and plain English.
+            ["semicolon"] = 0xBA, [";"] = 0xBA, ["oem1"] = 0xBA, ["oemsemicolon"] = 0xBA,
+            ["plus"] = 0xBB, ["="] = 0xBB, ["equals"] = 0xBB, ["oemplus"] = 0xBB,
+            ["comma"] = 0xBC, [","] = 0xBC, ["oemcomma"] = 0xBC,
+            ["minus"] = 0xBD, ["-"] = 0xBD, ["hyphen"] = 0xBD, ["dash"] = 0xBD, ["oemminus"] = 0xBD,
+            ["period"] = 0xBE, ["."] = 0xBE, ["dot"] = 0xBE, ["oemperiod"] = 0xBE,
+            ["slash"] = 0xBF, ["/"] = 0xBF, ["oem2"] = 0xBF, ["oemquestion"] = 0xBF,
+            ["tilde"] = 0xC0, ["`"] = 0xC0, ["grave"] = 0xC0, ["backtick"] = 0xC0, ["backquote"] = 0xC0,
+            ["oem3"] = 0xC0, ["oemtilde"] = 0xC0,
+            ["lbracket"] = 0xDB, ["["] = 0xDB, ["oem4"] = 0xDB, ["oemopenbrackets"] = 0xDB,
+            ["backslash"] = 0xDC, ["\\"] = 0xDC, ["oem5"] = 0xDC, ["oempipe"] = 0xDC,
+            ["rbracket"] = 0xDD, ["]"] = 0xDD, ["oem6"] = 0xDD, ["oemclosebrackets"] = 0xDD,
+            ["quote"] = 0xDE, ["'"] = 0xDE, ["apostrophe"] = 0xDE, ["oem7"] = 0xDE, ["oemquotes"] = 0xDE,
+            ["oem8"] = 0xDF, ["oem102"] = 0xE2, ["oembackslash"] = 0xE2,
+            // Other Windows constant names, for VK_PRIOR and the like.
+            ["prior"] = 0x21, ["next"] = 0x22, ["snapshot"] = 0x2C, ["capital"] = 0x14,
+            ["lcontrol"] = 0xA2, ["rcontrol"] = 0xA3, ["lmenu"] = 0xA4, ["rmenu"] = 0xA5
+        };
+
+        for (int i = 1; i <= 24; i++) map[$"f{i}"] = (ushort)(0x6F + i);       // F1 = 0x70
+        for (int i = 0; i <= 9; i++) map[$"num{i}"] = (ushort)(0x60 + i);      // numpad
+        for (char c = 'a'; c <= 'z'; c++) map[c.ToString()] = char.ToUpperInvariant(c);
+        for (char c = '0'; c <= '9'; c++) map[c.ToString()] = c;
+
+        return map;
+    }
+}

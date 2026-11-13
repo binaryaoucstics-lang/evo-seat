@@ -1,0 +1,300 @@
+using System.Diagnostics;
+using System.Text.Json.Nodes;
+using Anode.Core.Bridge;
+using Anode.Core.Capture;
+using Anode.Core.Gamepad;
+using Anode.Core.Input;
+using Anode.Core.Session;
+using Anode.Core.Util;
+
+namespace Anode.Cli;
+
+/// <summary>
+/// Exercises the parts of Anode that do not need a seat, so a machine can be checked
+/// before anyone enables anything. Nothing here injects keyboard or mouse input, and
+/// nothing here changes a setting.
+/// </summary>
+internal static class SelfTest
+{
+    public static int Run(string[] args)
+    {
+        // The checks' stand-ins log seats, launches and failures that never happened. Those lines go to
+        // a file of their own, kept and named only when a check fails, not to the user's log.
+        string checkLog = Path.Combine(Path.GetTempPath(), $"anode-selftest-{System.Environment.ProcessId}.log");
+        // A failed run long ago may have left a file under this process ID; don't mix two runs.
+        Remove(checkLog);
+        List<(string Name, bool Ok, string Detail)> results;
+        using (Log.Divert(checkLog)) results = RunChecks(args);
+
+        Console.WriteLine($"{Brand.Name} self-test\n");
+        foreach (var (name, ok, detail) in results)
+            Console.WriteLine($"  [{(ok ? "ok  " : "FAIL")}] {name,-26} {detail}");
+
+        int failures = results.Count(r => !r.Ok);
+        if (failures == 0) Remove(checkLog);
+        Console.WriteLine();
+        Console.WriteLine(failures == 0
+            ? $"All local checks passed. `{Brand.Command} doctor` covers the machine settings a seat still needs."
+            : $"{failures} check(s) failed. The checks' log is {checkLog}.");
+        return failures == 0 ? 0 : 1;
+    }
+
+    private static void Remove(string path)
+    {
+        try { File.Delete(path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* left in the temporary folder */ }
+    }
+
+    private static List<(string Name, bool Ok, string Detail)> RunChecks(string[] args)
+    {
+        var options = new Args(args);
+        bool quick = options.Flag("quick");
+        bool includeGamepad = !quick && !options.Flag("no-gamepad");
+        bool includeEnvironment = !quick && !options.Flag("no-scheduler");
+        var results = new List<(string Name, bool Ok, string Detail)>();
+
+        Check(results, "key names and chords", InputChecks.KeyChords);
+        Check(results, "text typing pace", InputChecks.Pacing);
+        Check(results, "text typing limits", InputChecks.Limits);
+        Check(results, "key and tap holds", InputChecks.Holds);
+        Check(results, "text typing waits", InputChecks.Waits);
+        Check(results, "scroll screen settle", InputChecks.ScreenSettles);
+
+        Check(results, "gamepad mapping", () =>
+        {
+            foreach (string name in new[] { "a", "b", "x", "y", "lb", "rb", "back", "start", "guide", "ls", "rs", "up", "down", "left", "right" })
+                GamepadManager.ResolveButton(name);
+            foreach (string name in new[] { "lx", "ly", "rx", "ry" }) GamepadManager.ResolveAxis(name);
+            foreach (string name in new[] { "lt", "rt" }) GamepadManager.ResolveTrigger(name);
+            return "15 buttons, 4 axes, 2 triggers";
+        });
+
+        Check(results, "controller isolation", GamepadChecks.Lists);
+        Check(results, "isolated controller attach", GamepadChecks.Attach);
+        Check(results, "gamepad set all or nothing", GamepadChecks.SetAllOrNothing);
+        Check(results, "gamepad names before dispatch", GamepadChecks.Names);
+        Check(results, "CLI help routing", CliChecks.HelpRouting);
+        Check(results, "CLI argument checks", CliChecks.Arguments);
+        Check(results, "CLI help and messages", CliChecks.HelpText);
+        Check(results, "CLI mcp --help", CliChecks.McpHelp);
+        Check(results, "CLI agent before connect", CliChecks.AgentBeforeConnect);
+        Check(results, "CLI missing agent subprocess", CliChecks.MissingAgentProcess);
+        Check(results, "channel names", ChannelChecks.Names);
+        Check(results, "one seat per session", ChannelChecks.Seat);
+
+        Check(results, "capture readiness", CaptureReadinessChecks.Run);
+        Check(results, "capture unavailable message", DiagnosticsChecks.CaptureUnavailableMessage);
+        if (includeEnvironment) Check(results, "screen capture", () =>
+        {
+            var shot = ScreenCapture.Capture(maxWidth: 640, format: "jpeg", jpegQuality: 70);
+            if (shot.Bytes.Length < 512) throw new InvalidOperationException("the encoder produced an implausibly small image");
+            return $"{shot.SourceWidth}x{shot.SourceHeight} -> {shot.Width}x{shot.Height}, {shot.Bytes.Length / 1024} KB jpeg";
+        });
+
+        if (includeEnvironment) Check(results, "screen geometry", () =>
+        {
+            var size = InputInjector.ScreenSize();
+            if (size.Width <= 0 || size.Height <= 0) throw new InvalidOperationException("no usable screen size");
+            return $"{size.Width}x{size.Height}";
+        });
+
+        Check(results, "pipe round trip", () =>
+        {
+            string name = $"anode-selftest-{System.Environment.ProcessId}";
+            using var server = new JsonPipeServer(name, request =>
+                Task.FromResult(JsonLine.Ok(new JsonObject { ["echo"] = request.Str("value") })));
+            server.Start();
+
+            using var client = JsonPipeClient.TryConnectAsync(name, 4000).GetAwaiter().GetResult()
+                ?? throw new InvalidOperationException("could not connect to the test pipe");
+
+            var response = client.RequestAsync("test", new JsonObject { ["value"] = "hello" }, 4000).GetAwaiter().GetResult();
+            if (response.Obj("result")?.Str("echo") != "hello")
+                throw new InvalidOperationException($"unexpected reply: {response.ToJsonString()}");
+
+            var failure = client.RequestAsync("test", new JsonObject(), 4000).GetAwaiter().GetResult();
+            if (failure.Bool("ok") != true) throw new InvalidOperationException("the echo handler failed");
+            return "request and response over a named pipe";
+        });
+
+        Check(results, "pipe queue deadline", () => TransportChecks.QueueDeadline().GetAwaiter().GetResult());
+        Check(results, "pipe forwarded time left", () => TransportChecks.ForwardTimeLeft().GetAwaiter().GetResult());
+        Check(results, "pipe late reply", () => TransportChecks.LateReply().GetAwaiter().GetResult());
+        Check(results, "pipe reply identity", () => TransportChecks.ReplyId().GetAwaiter().GetResult());
+        Check(results, "pipe close during request", () => TransportChecks.CloseDuringRequest().GetAwaiter().GetResult());
+        Check(results, "pipe server shutdown", () => TransportChecks.ServerShutdown().GetAwaiter().GetResult());
+        Check(results, "pipe access control", () => TransportChecks.PipeAccess().GetAwaiter().GetResult());
+        Check(results, "pipe connect cancellation", () =>
+        {
+            using var cancel = new CancellationTokenSource(100);
+            try
+            {
+                using var client = JsonPipeClient.TryConnectAsync($"anode-selftest-{Guid.NewGuid():N}", 5000, cancel.Token)
+                    .WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                throw new InvalidOperationException("connection attempt ignored cancellation");
+            }
+            catch (OperationCanceledException) when (cancel.IsCancellationRequested) { }
+            return "startup connection attempts can be interrupted by stop";
+        });
+        Check(results, "launch arguments", TransportChecks.LaunchArguments);
+        Check(results, "Steam launch guard", DiagnosticsChecks.SteamLaunchGuard);
+        Check(results, "Steam launch configuration", SteamChecks.LaunchConfiguration);
+        Check(results, "Steam launch placement", SteamChecks.Launch);
+        Check(results, "Steam namespace links", SteamChecks.Links);
+        Check(results, "desktop references", DesktopChecks.References);
+        Check(results, "desktop dispatch", () => DesktopChecks.Dispatch().GetAwaiter().GetResult());
+        Check(results, "layer desktop isolation", () => LayerChecks.DesktopIsolation().GetAwaiter().GetResult());
+        Check(results, "layer layouts", () => LayerChecks.RegionLayouts().GetAwaiter().GetResult());
+        Check(results, "layer input scheduling", () => LayerChecks.InputScheduling().GetAwaiter().GetResult());
+        Check(results, "desktop value batches", () => LayerChecks.BatchWrites().GetAwaiter().GetResult());
+        Check(results, "native session lookup", LayerChecks.SessionLookup);
+        Check(results, "layer clipboard isolation", LayerClipboardChecks.Isolation);
+        Check(results, "layer clipboard history policy", LayerClipboardChecks.HistoryPolicy);
+        Check(results, "desktop raise coverage", DesktopChecks.RaiseCoverage);
+        Check(results, "desktop raise reply", () => DesktopChecks.RaiseReply().GetAwaiter().GetResult());
+        Check(results, "desktop worker deadline", () => DesktopChecks.WorkerTimeout().GetAwaiter().GetResult());
+        Check(results, "layer persistent worker", () => DesktopChecks.PersistentWorker().GetAwaiter().GetResult());
+        Check(results, "desktop report escaping", DesktopChecks.Presentation);
+        Check(results, "desktop unknown control types", DesktopChecks.UnknownControlTypes);
+        Check(results, "desktop ignored set_value", DesktopChecks.IgnoredValues);
+        Check(results, "desktop repeated elements", DesktopChecks.RepeatedElements);
+        Check(results, "execution output", DevelopmentChecks.Output);
+        Check(results, "execution jobs", () => DevelopmentChecks.Jobs().GetAwaiter().GetResult());
+        Check(results, "execution job tail", () => DevelopmentChecks.JobTail().GetAwaiter().GetResult());
+        Check(results, "cancelled execution", () => DevelopmentChecks.CancelledStart().GetAwaiter().GetResult());
+        Check(results, "malformed pipe messages", () => TransportChecks.MalformedMessages().GetAwaiter().GetResult());
+        Check(results, "agent ownership", () => AgentChecks.Ownership().GetAwaiter().GetResult());
+        Check(results, "agent client lifetime", () => AgentChecks.ClientLifetime().GetAwaiter().GetResult());
+        Check(results, "agent client probe", AgentChecks.ClientProbe);
+        Check(results, "agent client validation", AgentChecks.ClientValidation);
+        Check(results, "MCP lease client process", () => McpChecks.LeaseClientProcess().GetAwaiter().GetResult());
+        Check(results, "agent queue and disconnect", () => AgentChecks.QueueAndDisconnect().GetAwaiter().GetResult());
+        Check(results, "agent queue time", () => AgentChecks.QueueTime().GetAwaiter().GetResult());
+        Check(results, "agent deadline replies", () => AgentChecks.DeadlineReplies().GetAwaiter().GetResult());
+        Check(results, "agent line", () => AgentChecks.Line().GetAwaiter().GetResult());
+        Check(results, "agent lease after a long action", () => AgentChecks.LongAction().GetAwaiter().GetResult());
+        Check(results, "agent names", () => AgentChecks.Names().GetAwaiter().GetResult());
+        Check(results, "MCP ownership", () => AgentChecks.McpOwnership().GetAwaiter().GetResult());
+        Check(results, "MCP lease helper", () => AgentChecks.McpLeaseHelper().GetAwaiter().GetResult());
+        Check(results, "agent startup and Stop", () => AgentChecks.StartupAndStop().GetAwaiter().GetResult());
+        Check(results, "UI condition waits", () => DevelopmentChecks.Waits().GetAwaiter().GetResult());
+        Check(results, "development validation", DevelopmentChecks.Validation);
+        Check(results, "display modes", DisplayChecks.Modes);
+        Check(results, "display validation", DisplayChecks.Validation);
+        Check(results, "display changes", () => DisplayChecks.Changes().GetAwaiter().GetResult());
+        Check(results, "display restored after a lease", () => DisplayChecks.Restore().GetAwaiter().GetResult());
+        Check(results, "display requests to the daemon", () => DisplayChecks.Daemon().GetAwaiter().GetResult());
+        Check(results, "display show failure", () => DisplayChecks.ShowFailure().GetAwaiter().GetResult());
+        Check(results, "display measurement", DisplayChecks.Measurement);
+        Check(results, "Android SDK and AVDs", AndroidChecks.Sdk);
+        Check(results, "Android emulators", () => AndroidChecks.Emulators().GetAwaiter().GetResult());
+        Check(results, "Android start deadlines", () => AndroidChecks.EmulatorDeadlines().GetAwaiter().GetResult());
+        Check(results, "Android validation", AndroidChecks.Validation);
+        Check(results, "seat launch guards", AndroidChecks.Guards);
+        Check(results, "Android Studio profile", AndroidChecks.Studio);
+        Check(results, "seat browser profile", AndroidChecks.Browser);
+        Check(results, "seat browser sign-in", AndroidChecks.BrowserSignIn);
+        Check(results, "seat browser profile in use", AndroidChecks.BrowserProfileInUse);
+        Check(results, "Android on this machine", AndroidChecks.ThisMachine);
+        Check(results, "audio clips", AudioChecks.Clips);
+        Check(results, "audio isolation and validation", AudioChecks.IsolationAndValidation);
+        Check(results, "audio MCP protocol", () => AudioChecks.Protocol().GetAwaiter().GetResult());
+        Check(results, "audio playback lifetime", () => AudioChecks.Lifecycle().GetAwaiter().GetResult());
+        Check(results, "viewer check deadlines", DevelopmentChecks.ViewerDeadlines);
+        Check(results, "hidden viewer startup", DevelopmentChecks.HiddenViewer);
+        Check(results, "viewer pointer guard", DiagnosticsChecks.ViewerPointerGuard);
+        Check(results, "RDP extended settings", DiagnosticsChecks.RdpSettings);
+        Check(results, "RDP event callbacks", DiagnosticsChecks.RdpCallbacks);
+        Check(results, "viewer sign-in", () => DiagnosticsChecks.ViewerSignIn().GetAwaiter().GetResult());
+        Check(results, "guest-only sign-in", () => DiagnosticsChecks.GuestOnlySignIn().GetAwaiter().GetResult());
+        Check(results, "daemon detached viewer", () => DiagnosticsChecks.DetachedViewer().GetAwaiter().GetResult());
+        Check(results, "stop during display change", () => DiagnosticsChecks.StopDuringDisplayChange().GetAwaiter().GetResult());
+        Check(results, "refused reconnect keeps the seat", () => DiagnosticsChecks.RefusedReconnect().GetAwaiter().GetResult());
+        Check(results, "rdp extended reasons", DiagnosticsChecks.RdpExtendedReasons);
+        Check(results, "RDP handshake diagnostics", DiagnosticsChecks.RdpHandshakeFailure);
+        Check(results, "RDP listener probe", () => DiagnosticsChecks.Listener().GetAwaiter().GetResult());
+        Check(results, "setup listener repair", DiagnosticsChecks.SetupListener);
+        Check(results, "startup disconnect", () => DiagnosticsChecks.StartupFailure().GetAwaiter().GetResult());
+        Check(results, "seat cleanup", () => DiagnosticsChecks.SeatCleanup().GetAwaiter().GetResult());
+        Check(results, "quit with a held window", () => DiagnosticsChecks.QuitHeldWindow().GetAwaiter().GetResult());
+        Check(results, "startup status polling", () => DiagnosticsChecks.StartupPolling().GetAwaiter().GetResult());
+        Check(results, "startup daemon discovery", () => StartupChecks.DaemonDiscovery().GetAwaiter().GetResult());
+        Check(results, "startup host connection", () => StartupChecks.HostConnection().GetAwaiter().GetResult());
+        Check(results, "startup state notification", () => StartupChecks.StateNotifications().GetAwaiter().GetResult());
+        Check(results, "detached start handles", StartupChecks.LaunchHandles);
+        Check(results, "log diagnostics", () => DiagnosticsChecks.Logging().GetAwaiter().GetResult());
+        Check(results, "self-test log", DiagnosticsChecks.SelfTestLog);
+        Check(results, "log timestamps", DiagnosticsChecks.LogTimestamps);
+        Check(results, "rendering backup locations", DiagnosticsChecks.RenderingBackups);
+        Check(results, "MCP stdio", () => TransportChecks.McpStdio().GetAwaiter().GetResult());
+        Check(results, "MCP validation", () => McpChecks.Validation().GetAwaiter().GetResult());
+        Check(results, "MCP agent discovery", () => McpChecks.Discovery().GetAwaiter().GetResult());
+        Check(results, "MCP stop and cancellation", () => McpChecks.StopAndCancellation().GetAwaiter().GetResult());
+        Check(results, "MCP disconnect", () => McpChecks.Disconnect().GetAwaiter().GetResult());
+        Check(results, "MCP busy daemon", () => McpChecks.BusyDaemon().GetAwaiter().GetResult());
+        Check(results, "MCP command ordering", () => McpChecks.OrderedCommands().GetAwaiter().GetResult());
+        Check(results, "seat identity guard", () =>
+        {
+            JsonObject Identity(int? child, int? parent) => JsonLine.Ok(new JsonObject
+            {
+                ["session"] = child, ["parentSession"] = parent
+            });
+            if (!Seat.SeatHost.MatchesSeat(3, Identity(3, 1)))
+                throw new InvalidOperationException("the daemon's child session was rejected");
+            foreach (var identity in new JsonObject?[] { null, JsonLine.Fail("unavailable"), Identity(null, 1), Identity(2, 1), Identity(3, 3), Identity(3, null), Identity(3, 0) })
+                if (Seat.SeatHost.MatchesSeat(3, identity))
+                    throw new InvalidOperationException("an unverified or parent session was accepted");
+            if (Seat.SeatHost.MatchesSeat(0, Identity(0, 1)) || Seat.SeatHost.MatchesSeat(uint.MaxValue, Identity(-1, 1)))
+                throw new InvalidOperationException("an invalid session id was accepted");
+            return "only the child session identified by a different parent session is accepted";
+        });
+
+        if (includeEnvironment) Check(results, "task scheduler logging", DiagnosticsChecks.ScheduledLogging);
+
+        if (includeGamepad)
+        {
+            Check(results, "virtual gamepad", () =>
+            {
+                using var pads = new GamepadManager();
+                pads.Attach(0);
+                try
+                {
+                    pads.Apply(0, new JsonObject
+                    {
+                        ["buttons"] = new JsonObject { ["a"] = true },
+                        ["axes"] = new JsonObject { ["lx"] = 0.5 },
+                        ["triggers"] = new JsonObject { ["rt"] = 1.0 }
+                    });
+                    pads.Reset(0);
+                    pads.Tap(0, "b", 30);
+                }
+                finally { pads.Detach(0); }
+                return "attached an Xbox 360 pad, moved a stick, tapped a button, detached";
+            });
+            Check(results, "seat-only gamepad", GamepadChecks.Live);
+        }
+
+        Check(results, "child-session API", () =>
+        {
+            bool enabled = ChildSession.IsFeatureEnabledSafe();
+            uint? existing = ChildSession.TryGetId();
+            return $"readable; feature {(enabled ? "enabled" : "disabled")}, current child session {(existing?.ToString() ?? "none")}";
+        });
+        return results;
+    }
+
+    private static void Check(List<(string, bool, string)> results, string name, Func<string> body)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            string detail = body();
+            results.Add((name, true, $"{detail} ({stopwatch.ElapsedMilliseconds} ms)"));
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"self-test '{name}' failed", ex);
+            results.Add((name, false, $"{ex.GetType().Name}: {ex.Message}"));
+        }
+    }
+}

@@ -1,0 +1,262 @@
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Anode.Core.Util;
+
+/// <summary>Well-known paths, pipe names and a very small log.</summary>
+internal static class Env
+{
+    /// <summary>The installed Anode's channel. It keeps the names every earlier version used.</summary>
+    public const string MainChannel = "main";
+
+#if DEBUG
+    public const string BuildChannel = "dev";
+#else
+    public const string BuildChannel = Brand.Channel;
+#endif
+
+    /// <summary>
+    /// Which Anode this process belongs to. Each channel has its own daemon, pipes, logs and viewer,
+    /// so a development build cannot reach or stop the installed Anode. Debug builds are dev;
+    /// ANODE_CHANNEL or --channel choose another.
+    /// </summary>
+    public static string Channel { get; private set; } = BuildChannel;
+
+    public static bool IsMainChannel => Channel == MainChannel;
+
+    /// <summary>" (dev)" after names people see, so two channels' windows and tray icons differ.</summary>
+    public static string ChannelSuffix => IsMainChannel ? string.Empty : $" ({Channel})";
+
+    /// <summary>Control pipe: the daemon serves it, the CLI and the MCP server talk to it.</summary>
+    public static string ControlPipe => ChannelName("anode-control");
+
+    /// <summary>Seat pipe: the seat host inside the child session serves it, the daemon talks to it.</summary>
+    public static string SeatPipe => ChannelName("anode-seat");
+
+    /// <summary>The main channel's daemon mutex, the only one Anode 0.8.0 and earlier take.</summary>
+    public const string MainDaemonMutex = @"Local\Anode.Daemon";
+
+    /// <summary>Mutex proving this channel's daemon is running.</summary>
+    public static string DaemonMutex => IsMainChannel ? MainDaemonMutex : MainDaemonMutex + "." + Channel;
+
+    private static string ChannelName(string name) => IsMainChannel ? name : name + "-" + Channel;
+
+    public static bool IsChannelName(string name) => Regex.IsMatch(name, "^[a-z0-9][a-z0-9-]{0,31}$");
+
+    public static void SetChannel(string name)
+    {
+        string channel = name.Trim().ToLowerInvariant();
+        if (!IsChannelName(channel))
+            throw new ArgumentException($"'{name}' is not a channel name. Use 1-32 letters, digits or hyphens, such as dev.");
+        Channel = channel;
+        if (!_stateDirectoryChosen)
+        {
+            StateDirectory = DefaultStateDirectory();
+            _stateDirectoryResolved = false;
+        }
+        // Programs this process starts, such as its workers, resolve the same channel.
+        System.Environment.SetEnvironmentVariable("ANODE_CHANNEL", channel == BuildChannel ? null : channel);
+    }
+
+    public static string StateDirectory { get; private set; } = DefaultStateDirectory();
+    private static bool _stateDirectoryResolved, _stateDirectoryChosen;
+
+    /// <summary>True when --state-dir named the state directory.</summary>
+    public static bool StateDirectoryChosen => _stateDirectoryChosen;
+
+    /// <summary>The state directory's name inside %LOCALAPPDATA%: Anode, or Anode-dev for the dev channel.</summary>
+    public static string StateFolderName => IsMainChannel ? "Anode" : "Anode-" + Channel;
+
+    public static string LocalAppData
+    {
+        get
+        {
+            string local = System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData);
+            return string.IsNullOrWhiteSpace(local)
+                ? Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile), "AppData", "Local")
+                : local;
+        }
+    }
+
+    private static string DefaultStateDirectory() => Path.GetFullPath(Path.Combine(LocalAppData, StateFolderName));
+
+    public static void SetStateDirectory(string path)
+    {
+        if (!Path.IsPathFullyQualified(path)) throw new ArgumentException("--state-dir must be an absolute path.");
+        StateDirectory = Path.GetFullPath(path);
+        _stateDirectoryResolved = false;
+        _stateDirectoryChosen = true;
+    }
+
+    public static string LogPath => Path.Combine(StateDirectory, "anode.log");
+
+    /// <summary>
+    /// Full path to anode.exe. The daemon relaunches this same file into the child
+    /// session, so it has to be the apphost and not a managed assembly path (which is
+    /// empty in a single-file build).
+    /// </summary>
+    public static string ExecutablePath =>
+        System.Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "anode.exe");
+
+    public static void EnsureStateDirectory()
+    {
+        Directory.CreateDirectory(StateDirectory);
+    }
+
+    public static void ResolveStateDirectory()
+    {
+        if (_stateDirectoryResolved) return;
+        StateDirectory = ResolveDirectory(StateDirectory);
+        _stateDirectoryResolved = true;
+    }
+
+    internal static string ResolveDirectory(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        // Packaged callers can see a redirected AppData folder. Task Scheduler
+        // does not inherit that package identity, so forward the actual directory.
+        // Resolve a writable file: MSIX can merge directory views while redirecting
+        // only the files beneath them, so a directory handle is not sufficient.
+        // A disposable marker also works when another process has locked the log.
+        using var file = File.OpenHandle(Path.Combine(directory, $".path-{Guid.NewGuid():N}.tmp"),
+            FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, FileOptions.DeleteOnClose);
+        var path = new StringBuilder(32768);
+        uint length = GetFinalPathNameByHandle(file, path, (uint)path.Capacity, 0);
+        if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (length >= path.Capacity) throw new PathTooLongException("The resolved Anode state directory is too long.");
+        string resolved = path.ToString();
+        resolved = resolved.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)
+            ? @"\\" + resolved[8..]
+            : resolved.StartsWith(@"\\?\", StringComparison.Ordinal) ? resolved[4..] : resolved;
+        return Path.GetDirectoryName(resolved) ?? throw new IOException("The Anode state file has no parent directory.");
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint length, uint flags);
+}
+
+/// <summary>
+/// Append-only log shared by every role. Writes are best effort: a seat that cannot
+/// log is still a seat, and losing a log line must never take the seat down.
+/// </summary>
+internal static class Log
+{
+    private static readonly object Gate = new();
+    private static string _role = "anode";
+    private static string? _lastWriteError;
+    private static int _reportedFailure;
+    private static string? _diverted;
+
+    /// <summary>
+    /// How long a line waits for other writers to finish theirs. Every role shares the file, and eight writers on a
+    /// slow machine outlasted the 100 ms this used to be. Once a write has failed, later lines wait only
+    /// <see cref="FailingShareWait"/> until one succeeds, so a log another program keeps locked costs one long wait,
+    /// then the old 100 ms a line, not a second a line.
+    /// </summary>
+    internal static TimeSpan ShareWait { get; set; } = TimeSpan.FromSeconds(1);
+    internal static readonly TimeSpan FailingShareWait = TimeSpan.FromMilliseconds(100);
+
+    public static string? LastWriteError => Volatile.Read(ref _lastWriteError);
+
+    /// <summary>The file this process's lines go to instead of the log, or null.</summary>
+    internal static string? Diverted { get { lock (Gate) return _diverted; } }
+
+    /// <summary>
+    /// Sends this process's lines to another file until the result is disposed. The self-test's stand-ins
+    /// log seats, launches and failures that never happened, which have no place in the user's log.
+    /// </summary>
+    internal static IDisposable Divert(string path)
+    {
+        lock (Gate)
+        {
+            var restore = new Diversion(_diverted);
+            _diverted = path;
+            return restore;
+        }
+    }
+
+    private sealed class Diversion : IDisposable
+    {
+        private readonly string? _previous;
+        public Diversion(string? previous) => _previous = previous;
+        public void Dispose() { lock (Gate) _diverted = _previous; }
+    }
+
+    public static void SetRole(string role) => _role = role;
+
+    public static void Info(string message) => Write("INFO", message);
+    public static void Warn(string message) => Write("WARN", message);
+    public static void Error(string message) => Write("ERR ", message);
+
+    public static void Error(string message, Exception ex) =>
+        Write("ERR ", $"{message}: {ex.GetType().Name}: {ex.Message}");
+
+    private static void Write(string level, string message)
+    {
+        // One format in every culture: a Thai Windows would otherwise write year 2569, a Finnish one 23.34.16.
+        string line = $"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)} {level} [{_role}] pid={System.Environment.ProcessId} {message}";
+        string path = Env.LogPath;
+        string? error = null;
+        lock (Gate)
+        {
+            try
+            {
+                path = _diverted ?? Env.LogPath;
+                Env.EnsureStateDirectory();
+                Append(path, line, LastWriteError is null ? ShareWait : FailingShareWait);
+                Volatile.Write(ref _lastWriteError, null);
+            }
+            catch (Exception ex)
+            {
+                // Set under the gate, so a failure can't overwrite a later line's success and shorten its wait.
+                error = $"Cannot write Anode log '{path}': {ex.GetType().Name}: {ex.Message}";
+                Volatile.Write(ref _lastWriteError, error);
+            }
+        }
+        // A detached process may have no stderr. Status also exposes this error.
+        if (error is not null && Interlocked.Exchange(ref _reportedFailure, 1) == 0)
+            try { Console.Error.WriteLine(error); } catch { }
+    }
+
+    internal static void Append(string path, string line, TimeSpan wait)
+    {
+        // Every role opens the same file. Retry sharing violations at open time,
+        // before writing any bytes, so a collision neither loses nor repeats a line.
+        // A random pause keeps writers that collided from colliding again in step.
+        long deadline = System.Environment.TickCount64 + (long)wait.TotalMilliseconds;
+        FileStream file;
+        while (true)
+        {
+            try
+            {
+                file = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+                break;
+            }
+            catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33 && System.Environment.TickCount64 < deadline)
+            {
+                Thread.Sleep(Random.Shared.Next(5, 21));
+            }
+        }
+        using (file)
+        {
+            const int limit = 16 * 1024 * 1024, keep = 4 * 1024 * 1024;
+            if (file.Length >= limit)
+            {
+                byte[] tail = new byte[keep];
+                file.Position = file.Length - keep;
+                file.ReadExactly(tail);
+                int start = Array.IndexOf(tail, (byte)'\n') + 1;
+                file.Position = 0;
+                file.Write(tail, start, tail.Length - start);
+                file.SetLength(file.Position);
+            }
+            file.Position = file.Length;
+            using var writer = new StreamWriter(file, new UTF8Encoding(false));
+            writer.WriteLine(line);
+        }
+    }
+}

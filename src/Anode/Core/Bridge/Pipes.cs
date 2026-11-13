@@ -1,0 +1,391 @@
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading.Channels;
+using Anode.Core.Util;
+
+namespace Anode.Core.Bridge;
+
+/// <summary>
+/// Newline-delimited JSON over a named pipe. Both hops in Anode speak it:
+/// CLI/MCP -> daemon, and daemon -> seat host. One JSON object per line, request
+/// then response, in order, on a single connection.
+/// </summary>
+internal static class JsonLine
+{
+    private static readonly JsonSerializerOptions Compact = new() { WriteIndented = false };
+
+    public static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+
+    public static string Serialize(JsonObject value) => value.ToJsonString(Compact);
+
+    public static JsonNode? ParseNode(string line)
+    {
+        var node = JsonNode.Parse(line);
+        // JsonNode materializes objects and strings lazily. Duplicate names and invalid
+        // Unicode escapes otherwise throw only when a handler reads them, possibly after acting.
+        try { Materialize(node); }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            throw new JsonException("JSON must have unique property names and well-formed Unicode strings.", ex);
+        }
+        return node;
+
+        static void Materialize(JsonNode? value)
+        {
+            if (value is JsonObject obj)
+                foreach (var property in obj) Materialize(property.Value);
+            else if (value is JsonArray array)
+                foreach (var item in array) Materialize(item);
+            else if (value is JsonValue scalar && scalar.GetValueKind() == JsonValueKind.String)
+                _ = scalar.GetValue<string>();
+        }
+    }
+
+    public static JsonObject? Parse(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return null;
+        try { return ParseNode(line) as JsonObject; }
+        catch (JsonException) { return null; }
+    }
+
+    public static JsonObject Ok(JsonObject? result = null)
+    {
+        var response = new JsonObject { ["ok"] = true };
+        if (result is not null) response["result"] = result;
+        return response;
+    }
+
+    public static JsonObject Fail(string error)
+    {
+        return new JsonObject { ["ok"] = false, ["error"] = error };
+    }
+
+    // ---- typed readers that tolerate whatever an agent actually sends ----
+
+    public static string? Str(this JsonObject o, string key) =>
+        o.TryGetPropertyValue(key, out var n) && n is not null ? n.ToString() : null;
+
+    public static int? Int(this JsonObject o, string key)
+    {
+        if (!o.TryGetPropertyValue(key, out var n) || n is null) return null;
+        try { return n.GetValue<int>(); }
+        catch { return int.TryParse(n.ToString(), out int v) ? v : null; }
+    }
+
+    public static bool? Bool(this JsonObject o, string key)
+    {
+        if (!o.TryGetPropertyValue(key, out var n) || n is null) return null;
+        try { return n.GetValue<bool>(); }
+        catch { return bool.TryParse(n.ToString(), out bool v) ? v : null; }
+    }
+
+    public static JsonObject? Obj(this JsonObject o, string key) =>
+        o.TryGetPropertyValue(key, out var n) ? n as JsonObject : null;
+}
+
+/// <summary>Serves newline-delimited JSON requests on a named pipe.</summary>
+internal sealed class JsonPipeServer : IDisposable
+{
+    private readonly string _pipeName;
+    private readonly Func<JsonObject, CancellationToken, Task<JsonObject>> _handler;
+    private readonly CancellationTokenSource _stopping = new();
+    private readonly object _pipeGate = new();
+    private readonly HashSet<NamedPipeServerStream> _connections = new();
+    private bool _disposed;
+    private Task? _acceptLoop;
+
+    public JsonPipeServer(string pipeName, Func<JsonObject, Task<JsonObject>> handler)
+        : this(pipeName, (request, _) => handler(request)) { }
+
+    public JsonPipeServer(string pipeName, Func<JsonObject, CancellationToken, Task<JsonObject>> handler)
+    {
+        _pipeName = pipeName;
+        _handler = handler;
+    }
+
+    public void Start() => _acceptLoop = Task.Run(AcceptLoopAsync);
+
+    private async Task AcceptLoopAsync()
+    {
+        while (!_stopping.IsCancellationRequested)
+        {
+            NamedPipeServerStream pipe;
+            try
+            {
+                lock (_pipeGate)
+                {
+                    if (_disposed) return;
+                    pipe = new NamedPipeServerStream(
+                        _pipeName,
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                    _connections.Add(pipe);
+                }
+            }
+            catch (IOException ex)
+            {
+                Log.Error($"pipe {_pipeName} could not be created", ex);
+                await Task.Delay(500).ConfigureAwait(false);
+                continue;
+            }
+
+            try
+            {
+                await pipe.WaitForConnectionAsync(_stopping.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+            {
+                CloseConnection(pipe);
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"pipe {_pipeName} accept failed", ex);
+                CloseConnection(pipe);
+                continue;
+            }
+
+            _ = Task.Run(() => ServeAsync(pipe));
+        }
+    }
+
+    private async Task ServeAsync(NamedPipeServerStream pipe)
+    {
+        try
+        {
+            using var reader = new StreamReader(pipe, JsonLine.Utf8, false, 8192, leaveOpen: true);
+            using var writer = new StreamWriter(pipe, JsonLine.Utf8, 8192, leaveOpen: true) { AutoFlush = true };
+            using var connection = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
+            var pending = Channel.CreateBounded<string>(8);
+            var reading = ReadRequestsAsync(reader, pending.Writer, connection);
+
+            try
+            {
+                await foreach (var line in pending.Reader.ReadAllAsync(connection.Token).ConfigureAwait(false))
+                {
+                    connection.Token.ThrowIfCancellationRequested();
+                    var request = JsonLine.Parse(line);
+                    JsonObject response;
+                    if (request is null)
+                    {
+                        response = JsonLine.Fail("request must be a JSON object with unique property names and well-formed Unicode strings");
+                    }
+                    else
+                    {
+                        try
+                        {
+                            response = await _handler(request, connection.Token).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (!connection.IsCancellationRequested)
+                        {
+                            Log.Error($"handler for '{request.Str("op")}' threw", ex);
+                            response = JsonLine.Fail($"{ex.GetType().Name}: {ex.Message}");
+                        }
+
+                        if (request.TryGetPropertyValue("id", out var id) && id is not null) response["id"] = id.DeepClone();
+                    }
+                    await writer.WriteLineAsync(JsonLine.Serialize(response).AsMemory(), connection.Token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                connection.Cancel();
+                await reading.ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (IOException) { /* client hung up */ }
+        catch (Exception ex) { Log.Error($"pipe {_pipeName} session ended badly", ex); }
+        finally
+        {
+            try { if (pipe.IsConnected) pipe.Disconnect(); } catch { }
+            CloseConnection(pipe);
+        }
+    }
+
+    // The reader keeps watching for EOF while the handler is acting. Closing a
+    // request pipe aborts its queued and in-flight work, even if no reply is due.
+    private static async Task ReadRequestsAsync(StreamReader reader, ChannelWriter<string> pending, CancellationTokenSource connection)
+    {
+        try
+        {
+            while (await reader.ReadLineAsync(connection.Token).ConfigureAwait(false) is { } line && pending.TryWrite(line)) { }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException) { }
+        finally
+        {
+            connection.Cancel();
+            pending.TryComplete();
+        }
+    }
+
+    private void CloseConnection(NamedPipeServerStream pipe)
+    {
+        lock (_pipeGate) _connections.Remove(pipe);
+        pipe.Dispose();
+    }
+
+    public void Dispose()
+    {
+        NamedPipeServerStream[] connections;
+        lock (_pipeGate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            connections = _connections.ToArray();
+        }
+        try { _stopping.Cancel(); } catch { }
+        foreach (var pipe in connections) CloseConnection(pipe);
+        try { _acceptLoop?.Wait(TimeSpan.FromSeconds(2)); } catch { }
+        // Active handlers may still unwind. Their cancellation source is managed
+        // state and can be collected once the handlers release the server.
+    }
+}
+
+/// <summary>Sends newline-delimited JSON requests to a <see cref="JsonPipeServer"/>.</summary>
+internal sealed class JsonPipeClient : IDisposable
+{
+    private readonly NamedPipeClientStream _pipe;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+    private readonly SemaphoreSlim _oneAtATime = new(1, 1);
+    private int _nextId;
+    private int _closed;
+
+    private JsonPipeClient(NamedPipeClientStream pipe)
+    {
+        _pipe = pipe;
+        _reader = new StreamReader(pipe, JsonLine.Utf8, false, 8192, leaveOpen: true);
+        _writer = new StreamWriter(pipe, JsonLine.Utf8, 8192, leaveOpen: true) { AutoFlush = true };
+    }
+
+    public bool IsConnected => Volatile.Read(ref _closed) == 0 && _pipe.IsConnected;
+
+    public static async Task<JsonPipeClient?> TryConnectAsync(string pipeName, int timeoutMs, CancellationToken cancel = default)
+    {
+        var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try
+        {
+            await pipe.ConnectAsync(timeoutMs, cancel).ConfigureAwait(false);
+            pipe.ReadMode = PipeTransmissionMode.Byte;
+            return new JsonPipeClient(pipe);
+        }
+        catch (TimeoutException)
+        {
+            await pipe.DisposeAsync().ConfigureAwait(false);
+            return null;
+        }
+        catch (IOException)
+        {
+            await pipe.DisposeAsync().ConfigureAwait(false);
+            return null;
+        }
+        catch
+        {
+            await pipe.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <param name="sendTimeLeft">
+    /// Sets the request's <c>timeoutMs</c> to the time left when it goes out. The receiver then bounds its work by
+    /// what this deadline still allows after the queue here, instead of starting a full clock of its own.
+    /// </param>
+    public async Task<JsonObject> RequestAsync(string op, JsonObject? args = null, int timeoutMs = 60_000, CancellationToken cancel = default,
+        bool sendTimeLeft = false)
+    {
+        var request = args is null ? new JsonObject() : (JsonObject)args.DeepClone();
+        request["op"] = op;
+        int id = Interlocked.Increment(ref _nextId);
+        request["id"] = id;
+
+        // Include queueing and writes in the deadline. In particular, a stop request
+        // must not wait indefinitely behind a long-running operation.
+        long started = Environment.TickCount64;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        deadline.CancelAfter(timeoutMs);
+        bool entered = false;
+        bool sent = false;
+        try
+        {
+            await _oneAtATime.WaitAsync(deadline.Token).ConfigureAwait(false);
+            entered = true;
+            if (!IsConnected) return Failure("connection_lost", "connection is closed; reconnect before sending another request", false);
+            if (sendTimeLeft)
+            {
+                long left = timeoutMs - (Environment.TickCount64 - started);
+                // With almost no time left, any reply would come too late, and a late reply costs the connection.
+                if (deadline.IsCancellationRequested || left < Math.Min(100, timeoutMs / 8)) return NotSent(op, timeoutMs);
+                request["timeoutMs"] = TimeLeft(timeoutMs, timeoutMs - left);
+            }
+            sent = true;
+            await _writer.WriteLineAsync(JsonLine.Serialize(request).AsMemory(), deadline.Token).ConfigureAwait(false);
+            string? line = await _reader.ReadLineAsync(deadline.Token).ConfigureAwait(false);
+            if (line is null) throw new IOException("connection closed before a reply arrived");
+            var response = JsonLine.Parse(line) ?? throw new IOException("reply was not a JSON object");
+            if (response.Int("id") != id) throw new IOException("reply did not match the request id");
+            return response;
+        }
+        catch (OperationCanceledException)
+        {
+            // Once a request is on the wire, a late reply would otherwise be read
+            // as the next request's result. Do not reuse that connection or replay
+            // the command: it may already have changed something in the seat.
+            if (sent) Close();
+            cancel.ThrowIfCancellationRequested();
+            return sent ? Failure("timed_out", $"'{op}' timed out after {timeoutMs} ms; inspect the effect before acting again", true) : NotSent(op, timeoutMs);
+        }
+        catch (IOException ex)
+        {
+            Close();
+            return Failure("connection_lost", $"connection lost during '{op}': {ex.Message}", sent);
+        }
+        catch (ObjectDisposedException)
+        {
+            Close();
+            return Failure("connection_lost", $"connection closed during '{op}'", sent);
+        }
+        finally
+        {
+            if (entered) _oneAtATime.Release();
+        }
+    }
+
+    /// <summary>
+    /// A request whose time ran out before it went out. It carries the seat host's <c>timed_out</c> failure for an
+    /// action that never got the desktop, so a caller can tell that nothing ran.
+    /// </summary>
+    private static JsonObject NotSent(string op, int timeoutMs) =>
+        Failure("timed_out", $"'{op}' timed out after {timeoutMs} ms while it waited; nothing was sent", false);
+
+    internal static JsonObject Failure(string code, string message, bool started)
+    {
+        var failure = JsonLine.Fail(message);
+        failure["errorCode"] = code;
+        failure["started"] = started;
+        return failure;
+    }
+
+    /// <summary>
+    /// What is left of a request's time after a wait. Waits under 100 ms (a sixteenth of a shorter time) are the
+    /// ordinary cost of passing a request on and aren't counted, so limits derived from the time, such as how much
+    /// one call may type, don't depend on clock ticks.
+    /// </summary>
+    internal static int TimeLeft(int timeoutMs, long waitedMs) =>
+        waitedMs < Math.Min(100, timeoutMs / 16) ? timeoutMs : (int)Math.Max(1, timeoutMs - waitedMs);
+
+    private void Close()
+    {
+        if (Interlocked.Exchange(ref _closed, 1) == 0) _pipe.Dispose();
+    }
+
+    // Closing the pipe interrupts in-flight I/O. Leave the managed reader, writer
+    // and semaphore for GC so concurrent requests can unwind and release the gate.
+    public void Dispose() => Close();
+}
