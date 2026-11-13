@@ -37,10 +37,13 @@ internal sealed class SeatWindow : Form
     private readonly ToolStripMenuItem _traySignIn = new("Sign in…");
     private readonly Icon? _icon = LoadIcon();
     private readonly SeatPlaceholder _placeholder;
+    private readonly SeatRegionFrames _regionFrames = new();
     /// <summary>Where the seat shows: the viewer's dark background around a control of the seat's shape.</summary>
     private readonly Panel _seatArea = new();
     private readonly bool _fitSeat;
     private Size _seatSize;
+    private Size _regionSource;
+    private SeatRegion[] _regions = [];
     private Size _monitorFitSize;
     private Rectangle _monitorWorkArea;
     private Control? _standIn;
@@ -83,6 +86,8 @@ internal sealed class SeatWindow : Form
         _seatArea.Dock = DockStyle.Fill;
         if (_fitSeat) Viewer.Dock = DockStyle.None;
         _seatArea.Controls.Add(Viewer);
+        _seatArea.Controls.Add(_regionFrames);
+        _regionFrames.BringToFront();
         _seatArea.Resize += (_, _) => PlaceSeat();
         Viewer.RemoteSizeChanged += SetSeatSize;
 
@@ -194,6 +199,34 @@ internal sealed class SeatWindow : Form
         var bounds = new Rectangle((area.Width - width) / 2, (area.Height - height) / 2, width, height);
         Viewer.Bounds = bounds;
         if (_standIn is not null) _standIn.Bounds = bounds;
+        PlaceRegionFrames();
+    }
+
+    internal void SetSeatRegions(Size source, SeatRegion[] regions)
+    {
+        if (InvokeRequired) { BeginInvoke(new Action(() => SetSeatRegions(source, regions))); return; }
+        _regionSource = source;
+        _regions = regions;
+        PlaceRegionFrames();
+    }
+
+    private void PlaceRegionFrames()
+    {
+        if (!_monitorMode || !_seatPictureLive || Viewer.Width <= 0 || Viewer.Height <= 0)
+        {
+            _regionFrames.Hide();
+            return;
+        }
+        // A resolution change can reach RDP before the corresponding layout update.
+        // Never project the old layout over a picture at the new resolution.
+        if (_regionSource != Size.Empty && _regionSource != _seatSize)
+        {
+            _regionFrames.Hide();
+            return;
+        }
+        _regionFrames.UpdateFrames(Viewer.Bounds, _seatSize,
+            _regions.Length == 0 ? [new SeatRegion(1, new Rectangle(Point.Empty, _seatSize), true)] : _regions,
+            controlling: !ViewOnly);
     }
 
     private static Size FitPicture(Size seat, Size area)
@@ -232,18 +265,22 @@ internal sealed class SeatWindow : Form
         get => _viewOnly;
         set
         {
-            if (_monitorMode && !value) return;
             _viewOnly = value;
             Viewer.SetInputEnabled(!value);
-            _controlButton.Text = value ? "Take control" : "Release control";
+            _controlButton.Text = _monitorMode ? (value ? "接管鼠标" : "归还控制")
+                : (value ? "Take control" : "Release control");
             _controlButton.Checked = !value;
             _controlButton.AccessibleName = _controlButton.Text;
-            _modeLabel.Text = value ? "View only" : "You have control";
+            _modeLabel.Text = _monitorMode ? (value ? "只读监看" : "手动控制中")
+                : (value ? "View only" : "You have control");
             _modeLabel.ForeColor = value ? ViewerTheme.Muted : ViewerTheme.Accent;
-            _controlButton.ToolTipText = value
-                ? "Let your mouse and keyboard reach the seat."
-                : "Stop your mouse and keyboard from reaching the seat.";
-            _modeLabel.ToolTipText = value ? "Your clicks and keystrokes do not reach the seat." : _controlButton.ToolTipText;
+            _controlButton.ToolTipText = _monitorMode
+                ? (value ? "让鼠标和键盘操作后台桌面。" : "停止发送鼠标和键盘操作，恢复只读监看。")
+                : (value ? "Let your mouse and keyboard reach the seat." : "Stop your mouse and keyboard from reaching the seat.");
+            _modeLabel.ToolTipText = value
+                ? (_monitorMode ? "当前鼠标和键盘操作不会发到后台桌面。" : "Your clicks and keystrokes do not reach the seat.")
+                : _controlButton.ToolTipText;
+            PlaceRegionFrames();
             RefreshDetails();
         }
     }
@@ -275,7 +312,11 @@ internal sealed class SeatWindow : Form
         _controlButton.Name = "ControlSeat";
         _controlButton.CheckOnClick = false;
         ViewerTheme.Decorate(_controlButton, new(Glyph: ViewerTheme.Glyphs.Pointer));
-        _controlButton.Click += (_, _) => ViewOnly = !ViewOnly;
+        _controlButton.Click += (_, _) =>
+        {
+            ViewOnly = !ViewOnly;
+            if (_monitorMode && !ViewOnly) Viewer.Focus();
+        };
 
         _fullScreenButton.Text = "Full screen";
         _fullScreenButton.Name = "FullScreen";
@@ -551,6 +592,7 @@ internal sealed class SeatWindow : Form
     public void SetSeatInfo(uint? sessionId, bool hostReady)
     {
         if (InvokeRequired) { BeginInvoke(new Action(() => SetSeatInfo(sessionId, hostReady))); return; }
+        if (sessionId != _sessionId || !hostReady) SetSeatRegions(Size.Empty, []);
         _sessionId = sessionId;
         _seatLabel.Text = sessionId is null
             ? "No seat"
@@ -573,6 +615,12 @@ internal sealed class SeatWindow : Form
         if (InvokeRequired) { BeginInvoke(new Action(() => SetSeatPictureLive(live))); return; }
         _seatPictureLive = live;
         _placeholder.Visible = !live;
+        if (_monitorMode)
+        {
+            _controlButton.Enabled = live;
+            if (!live && !ViewOnly) ViewOnly = true;
+        }
+        PlaceRegionFrames();
     }
 
     internal void CreateHiddenViewer()
@@ -597,6 +645,7 @@ internal sealed class SeatWindow : Form
         // Respect an open viewer, including an explicit handover of mouse control.
         if (Visible) return;
         SetMonitorMode(true);
+        if (!ViewOnly) ViewOnly = true;
         FitMonitor(Screen.FromPoint(Cursor.Position));
         // Reapply the no-activate flag for this show; an earlier connection may have cleared it.
         _noActivate = true;
@@ -612,24 +661,23 @@ internal sealed class SeatWindow : Form
         _monitorMode = enabled;
         Text = enabled ? $"{Brand.Name} · 实时监看" : Brand.Name + Env.ChannelSuffix;
         AccessibleName = Text;
-        if (enabled)
-        {
-            _detailsButton.Checked = false;
-            ViewOnly = true;
-        }
+        if (enabled) _detailsButton.Checked = false;
         else _monitorFitSize = Size.Empty;
+        ViewOnly = enabled || ViewOnly;
         Viewer.Dock = _fitSeat || enabled ? DockStyle.None : DockStyle.Fill;
         Viewer.SetSmartSizing(_fitSeat || enabled);
-        foreach (var item in new ToolStripItem[] { _stopButton, _controlButton, _reconnectButton, _signInButton, _detailsButton })
+        foreach (var item in new ToolStripItem[] { _stopButton, _reconnectButton, _signInButton, _detailsButton })
             item.Available = !enabled;
+        _controlButton.Enabled = !enabled || _seatPictureLive;
         _hideMonitorButton.Available = enabled;
-        _modeLabel.Text = enabled ? "只读监看" : ViewOnly ? "View only" : "You have control";
+        PlaceSeat();
         SetHeadline(_state);
     }
 
     public void HideViewer()
     {
         if (InvokeRequired) { BeginInvoke(new Action(HideViewer)); return; }
+        if (_monitorMode && !ViewOnly) ViewOnly = true;
         if (_fullScreen) ToggleFullScreen();
         Hide();
     }

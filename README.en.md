@@ -8,6 +8,7 @@ EVO Seat gives Codex a hidden Windows desktop for operating and testing real GUI
 - **Share the seat.** Codex starts with two regions. The third task expands the layout to four regions, and the fifth expands it to twelve. Running tasks keep their windows and region positions. Use an exclusive lease for operations that need the full desktop. The seat shares the Windows account and files.
 - **Capture evidence.** Request a full-resolution PNG for small text or combine accessibility data and a screenshot when verifying a receipt.
 - **Watch live.** A read-only monitor opens when a background task takes a new desktop lease. The exclusive desktop defaults to 1440 × 900. The window follows layout changes as they happen. The picture stays at native pixel size when it fits and scales down to the current display's work area when needed. Hiding the monitor leaves the task running. Reopen it from the system tray.
+- **Region borders and mouse control.** Each region has a number and a border. In-use regions have brighter borders. Click **接管鼠标** (Take control) to use your mouse and keyboard on the background desktop. The borders turn teal while you have control. Click **归还控制** (Release control) or hide the monitor to return to read-only viewing.
 
 For installation, give your Codex agent the [installation guide](docs/codex.md). For operation, give it the [agent workflow](AGENTS.md).
 

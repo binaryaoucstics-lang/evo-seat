@@ -859,7 +859,11 @@ internal sealed class AnodeDaemon : IDisposable
                         viewer.BeginInvoke(new Action(() =>
                         {
                             if (!_hostReady || _stopRequested || stopVersion != Volatile.Read(ref _stopVersion)) return;
-                            try { viewer.ShowMonitor(); }
+                            try
+                            {
+                                viewer.ShowMonitor();
+                                _ = Task.Run(WatchDeskAsync);
+                            }
                             catch (Exception ex) { Log.Warn($"Could not open the live monitor: {ex.Message}"); }
                         }));
                     }
@@ -1249,8 +1253,7 @@ internal sealed class AnodeDaemon : IDisposable
     }
 
     /// <summary>
-    /// Keeps the viewer's footer saying who holds the desktop, while someone can see it. The lease
-    /// lives in the seat host, where it also expires, so this asks rather than listening.
+    /// Reads the lease and authoritative layer geometry while someone can see the viewer.
     /// </summary>
     private async Task WatchDeskAsync()
     {
@@ -1258,6 +1261,23 @@ internal sealed class AnodeDaemon : IDisposable
         try
         {
             using var probe = await JsonPipeClient.TryConnectAsync(Env.SeatPipe, 500).ConfigureAwait(false);
+            if (probe is not null)
+            {
+                var pong = await probe.RequestAsync("ping", timeoutMs: 1200).ConfigureAwait(false);
+                var result = pong.Obj("result");
+                if (pong.Bool("ok") == true && result?.Int("session") == (int?)_sessionId
+                    && result?.Obj("screen") is { } screen && screen.Int("width") is > 0 and int width
+                    && screen.Int("height") is > 0 and int height && result?.Obj("layers") is { } layers)
+                {
+                    var regions = (layers["regions"] as JsonArray ?? new JsonArray()).OfType<JsonObject>()
+                        .Select(region => new SeatRegion(region.Int("number") ?? 0,
+                            new Rectangle(region.Int("x") ?? 0, region.Int("y") ?? 0,
+                                region.Int("width") ?? 0, region.Int("height") ?? 0), region.Bool("occupied") == true))
+                        .Where(region => region.Number > 0 && region.Bounds.Width > 0 && region.Bounds.Height > 0).ToArray();
+                    if (layers.Bool("displayChanged") != true)
+                        window.SetSeatRegions(new Size(width, height), regions);
+                }
+            }
             var desk = probe is null ? null : await DeskAsync(probe).ConfigureAwait(false);
             window.SetDesk(desk?.Str("ownerAgentId") is { } owner ? desk.Str("ownerName") ?? owner : null,
                 (desk?["waiting"] as JsonArray)?.Count ?? 0, known: desk is not null);

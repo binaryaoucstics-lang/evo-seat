@@ -100,13 +100,31 @@ internal sealed class LayerHub
     public bool Contains(string? id) { lock (_state) return id is not null && _layers.ContainsKey(id); }
     public JsonObject Snapshot()
     {
-        lock (_state) return new JsonObject
+        lock (_state)
         {
-            ["count"] = _layers.Count == 0 ? 0 : _regions.Length,
-            ["owners"] = new JsonArray(_layers.Keys.Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
-            ["closing"] = _layers.Values.Count(c => c.Closing is not null),
-            ["displayChanged"] = _layers.Count > 0 && _layoutScreen != InputInjector.ScreenSize()
-        };
+            bool active = _layers.Count > 0;
+            bool displayChanged = active && _layoutScreen != InputInjector.ScreenSize();
+            var regions = new JsonArray();
+            if (active && !displayChanged)
+            {
+                var occupied = _layers.Values.Select(layer => layer.Slot).ToHashSet();
+                for (int slot = 0; slot < _regions.Length; slot++)
+                {
+                    var region = WindowAccess.RectangleJson(_regions[slot]);
+                    region["number"] = slot + 1;
+                    region["occupied"] = occupied.Contains(slot);
+                    regions.Add(region);
+                }
+            }
+            return new JsonObject
+            {
+                ["count"] = active ? _regions.Length : 0,
+                ["owners"] = new JsonArray(_layers.Keys.Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
+                ["closing"] = _layers.Values.Count(c => c.Closing is not null),
+                ["displayChanged"] = displayChanged,
+                ["regions"] = regions
+            };
+        }
     }
 
     internal const string InvalidLayerCount = "layerCount must be 2, 4, or 12.";
