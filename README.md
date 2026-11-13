@@ -1,14 +1,17 @@
 # EVO Seat
 
-[English](README.en.md) · [Codex 安装教程](docs/codex.zh-CN.md) · [Agent 操作说明](AGENTS.md) · [下载发行版](https://github.com/binaryaoucstics-lang/evo-seat/releases)
+[English](README.en.md) · [Codex 安装教程](docs/codex.zh-CN.md) · [Agent 操作说明](AGENTS.md) · [下载最新版](https://github.com/binaryaoucstics-lang/evo-seat/releases/latest)
 
 EVO Seat 为 Codex 提供一个隐藏的 Windows 桌面。Agent 可以在里面打开真实应用、读取控件、操作鼠标键盘、截图和验证结果，你可以继续使用前台桌面。
 
 - **观察并操作。** 可以按窗口 ID、无障碍控件或桌面坐标操作。中间步骤给 `seat_element` 传入 `observeAfter: true`，即可在同一次调用里拿到操作后的新快照。
 - **多 Agent 协作。** 支持独占租约，以及 2、4 或 12 个分区。各分区共享 Windows 账户和文件。
 - **留存操作证据。** 看小字时可取原始尺寸 PNG，核对回执时可同时获取控件数据和截图。
+- **实时监看。** 后台任务取得新的桌面租约时，会自动打开只读窗口。独占桌面默认 1440 × 900，并发模式按分区数扩展桌面。画面能放下时按实际像素尺寸显示，超出当前显示器可用区域时等比缩小，保留全部分区。点击「隐藏画面」可收起窗口，任务继续运行。可从系统托盘重新打开。
 
 把[安装教程](docs/codex.zh-CN.md)交给 Codex 即可开始安装。安装后，让 Agent 按[操作说明](AGENTS.md)使用隐藏桌面。
+
+可在启动新会话时用 `--no-monitor` 关闭自动监看，命令见 [Codex 安装教程](docs/codex.zh-CN.md#4-监看后台任务)。
 
 ## Windows 画图实测对比
 

@@ -21,6 +21,12 @@ internal static class DevelopmentChecks
             Application.DoEvents();
             created();
             Require(window.IsHandleCreated && window.Viewer.IsHandleCreated && !window.Visible && shown == 0, "hidden startup showed the viewer or omitted its native control");
+            Require(Daemon.SeatWindow.MonitorPictureSize(new Size(1440, 900), new Size(1920, 1000)) == new Size(1440, 900),
+                "monitor upscaled a desktop that fit at its native size");
+            Require(Daemon.SeatWindow.MonitorPictureSize(new Size(5760, 2700), new Size(1920, 1000)) == new Size(1920, 900),
+                "monitor cropped or stretched the twelve-region desktop");
+            Require(Daemon.SeatWindow.MonitorPictureSize(new Size(2880, 1800), new Size(1920, 1000)) == new Size(1600, 1000),
+                "monitor did not fit the four-region desktop when height constrained it");
             // The window opens with the seat filling its area; other shapes keep the seat's shape, centred on
             // the dark area, since the Remote Desktop control pads a mismatched shape with white bars.
             var area = (Panel)window.Controls.Find("SeatArea", false).Single();
@@ -154,10 +160,11 @@ internal static class DevelopmentChecks
             + "named; a failure before it surfaces at once";
     }
 
-    /// <summary>A 1280x720 seat within a pixel, centred in the area; <paramref name="fills"/> also requires no space beside it.</summary>
+    /// <summary>The default seat's aspect ratio within a pixel, centred in the area.</summary>
     private static bool SeatShaped(Rectangle seat, Size area, bool fills)
     {
-        bool shaped = Math.Abs(seat.Width * 720 - seat.Height * 1280) <= 1280;
+        bool shaped = Math.Abs(seat.Width * Daemon.SeatOptions.DefaultHeight - seat.Height * Daemon.SeatOptions.DefaultWidth)
+            <= Daemon.SeatOptions.DefaultWidth;
         bool centred = Math.Abs(seat.Left * 2 + seat.Width - area.Width) <= 1 && Math.Abs(seat.Top * 2 + seat.Height - area.Height) <= 1;
         bool filled = Math.Abs(seat.Width - area.Width) <= 1 && Math.Abs(seat.Height - area.Height) <= 1;
         return shaped && centred && (!fills || filled);

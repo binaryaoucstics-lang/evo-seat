@@ -31,7 +31,7 @@ internal static class ViewerPreview
     private static readonly Dictionary<string, string> Samples = new()
     {
         ["connecting"] = "Creating the seat...",
-        ["ready"] = "Seat ready in session 2 at 1280x720. Programs you start here stay out of your way.",
+        ["ready"] = $"Seat ready in session 2 at {Daemon.SeatOptions.DefaultWidth}x{Daemon.SeatOptions.DefaultHeight}. Programs you start here stay out of your way.",
         ["detached"] = "The viewer disconnected but the seat is still running. Press Reconnect in the viewer to watch it again.",
         ["logon-error"] = "Windows could not sign in the seat. Press Sign in… to use the Windows credential dialog."
     };

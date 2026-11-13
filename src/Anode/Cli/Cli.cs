@@ -337,8 +337,8 @@ internal static partial class Cli
         var options = new Args(args);
         var seat = new SeatOptions
         {
-            Width = options.Int("width") ?? 1280,
-            Height = options.Int("height") ?? 720,
+            Width = options.Int("width") ?? SeatOptions.DefaultWidth,
+            Height = options.Int("height") ?? SeatOptions.DefaultHeight,
             Audio = options.Flag("audio"),
             ShareClipboard = options.Flag("clipboard"),
             CaptureWindowsKeys = options.Flag("winkeys"),
@@ -346,6 +346,7 @@ internal static partial class Cli
             ScaleFactor = options.Int("scale"),
             StartViewOnly = !options.Flag("control"),
             ShowWindow = !options.Flag("hidden"),
+            AutoMonitor = !options.Flag("no-monitor"),
             KeepSeatOnExit = options.Flag("keep"),
             PromptForCredentials = options.Flag("sign-in"),
             ConfigureBackgroundRendering = !options.Flag("no-background-rendering")
@@ -822,7 +823,7 @@ internal static partial class Cli
         string? Notes, int Words, string[]? Options);
 
     private const string SeatOptionList =
-        "hidden width# height# scale# no-scaling audio clipboard winkeys control sign-in no-background-rendering state-dir= keep";
+        "hidden no-monitor width# height# scale# no-scaling audio clipboard winkeys control sign-in no-background-rendering state-dir= keep";
 
     private static CommandHelp Row(string group, string names, string? options, int words, string? notes,
         params (string Usage, string Text)[] lines) =>
@@ -1040,8 +1041,9 @@ internal static partial class Cli
 
     private static readonly (string Option, string Text)[] SeatOptionHelp =
     {
-        ("--hidden", "keep the viewer closed"),
-        ("--width N --height N", "seat resolution, default 1280x720; `anode display` changes it later"),
+        ("--hidden", "start with the viewer closed"),
+        ("--no-monitor", "keep the live monitor closed when an agent takes a desktop lease"),
+        ("--width N --height N", $"seat resolution, default {SeatOptions.DefaultWidth}x{SeatOptions.DefaultHeight}; `anode display` changes it later"),
         ("--scale N", "Windows scaling percentage for the seat, such as 150"),
         ("--no-scaling", "show the seat at its own size instead of fitting it to the viewer"),
         ("--audio", "play the seat's sound on this computer (off by default)"),

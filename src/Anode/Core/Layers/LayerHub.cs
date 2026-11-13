@@ -134,7 +134,8 @@ internal sealed class LayerHub
     internal static string[] StartupArguments(int count)
     {
         var (columns, rows) = Grid(count);
-        return columns == 0 ? ["--hidden"] : ["--hidden", "--width", $"{1440 * columns}", "--height", $"{900 * rows}"];
+        return columns == 0 ? ["--hidden"] :
+            ["--hidden", "--width", $"{Daemon.SeatOptions.DefaultWidth * columns}", "--height", $"{Daemon.SeatOptions.DefaultHeight * rows}"];
     }
 
     public static JsonObject Failure(string code, string message)
@@ -173,6 +174,7 @@ internal sealed class LayerHub
                 if (_layers.Count > 0 && screen != _layoutScreen)
                     return (Failure("layer_display", "The active layout display size changed. Restore it or release the layers."), null);
                 if (c?.Closing is not null) return (Failure("seat_busy", "This layer is still closing."), null);
+                bool leaseStarted = c is null;
                 if (c is null)
                 {
                     if (_layers.Count >= count) return (Failure("seat_busy", $"All {count} layers are occupied."), null);
@@ -189,7 +191,9 @@ internal sealed class LayerHub
                 c.TtlMs = (request.Int("ttlSeconds") ?? 120) * 1000;
                 c.Expires = Environment.TickCount64 + c.TtlMs;
                 c.ClientPid = request.Int("clientPid"); c.ClientStarted = request["clientStarted"]?.GetValue<long>() ?? 0;
-                return (JsonLine.Ok(State(c, true)), null);
+                var acquired = JsonLine.Ok(State(c, true));
+                if (leaseStarted) acquired["leaseStarted"] = true;
+                return (acquired, null);
             }
             if (action == "status")
             {

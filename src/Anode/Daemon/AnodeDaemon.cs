@@ -434,6 +434,7 @@ internal sealed class AnodeDaemon : IDisposable
                 var screen = DisplayMode.FromJson(pong.Obj("result")?.Obj("screen"));
                 // Measured rather than taken from the options: this is what a reset restores.
                 _startDisplay ??= screen;
+                if (screen is { } measured) _window?.SetSeatSize(measured.Width, measured.Height);
                 SetState("ready", $"Seat ready in session {id} at {screen?.ToString() ?? "an unknown size"}. Programs you start here stay out of your way.");
             }
             Log.Info($"seat ready: session {id}");
@@ -850,7 +851,22 @@ internal sealed class AnodeDaemon : IDisposable
                     var started = await StartSeatAsync(stopVersion).WaitAsync(connection).ConfigureAwait(false);
                     if (started.Bool("ok") != true) return started;
                 }
-                return await ForwardToSeatAsync(op, request, connection).ConfigureAwait(false);
+                var lease = await ForwardToSeatAsync(op, request, connection).ConfigureAwait(false);
+                if (_options.AutoMonitor && lease.Bool("leaseStarted") == true && _window is { } viewer)
+                {
+                    try
+                    {
+                        viewer.BeginInvoke(new Action(() =>
+                        {
+                            if (!_hostReady || _stopRequested || stopVersion != Volatile.Read(ref _stopVersion)) return;
+                            try { viewer.ShowMonitor(); }
+                            catch (Exception ex) { Log.Warn($"Could not open the live monitor: {ex.Message}"); }
+                        }));
+                    }
+                    catch (InvalidOperationException ex) { Log.Warn($"Could not queue the live monitor: {ex.Message}"); }
+                }
+                lease.Remove("leaseStarted");
+                return lease;
 
             case "seat.show":
                 _window?.ShowViewer();
@@ -1097,6 +1113,7 @@ internal sealed class AnodeDaemon : IDisposable
             _display = shown;
         }
         Log.Info($"the seat shows {shown} after a display change that did not arrive as asked; later viewer connections ask for it");
+        _window?.SetSeatSize(shown.Width, shown.Height);
         return JsonLine.Ok(new JsonObject { ["method"] = "record", ["display"] = shown.ToJson() });
     }
 
@@ -1180,6 +1197,7 @@ internal sealed class AnodeDaemon : IDisposable
             ["loginComplete"] = _window?.Viewer.LoginCompleted ?? false,
             ["signInPrompt"] = _promptForCredentials && _state is "connecting" or "signing-in",
             ["viewerVisible"] = _window?.Visible ?? false,
+            ["monitorVisible"] = _window?.MonitorVisible ?? false,
             ["viewOnly"] = _window?.ViewOnly ?? true,
             ["pointerGuard"] = PointerGuard.Status(),
             ["backgroundRenderingConfigured"] = BackgroundRendering.Current() == 2,

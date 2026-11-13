@@ -248,6 +248,12 @@ internal sealed class RdpViewer : AxHost
         PointerGuard.Track(Handle, enabled);
     }
 
+    public void SetSmartSizing(bool enabled)
+    {
+        if (IsHandleCreated && Dispatch.Get(Ocx, "AdvancedSettings9") is { } advanced)
+            Dispatch.TrySet(advanced, "SmartSizing", enabled);
+    }
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnableWindow(IntPtr hWnd, [MarshalAs(UnmanagedType.Bool)] bool enable);
@@ -316,8 +322,10 @@ internal sealed class RdpViewer : AxHost
 /// <summary>How a seat should be created. Set once at `anode up` and kept for reconnects; an agent's display change replaces the size and scale.</summary>
 internal sealed record SeatOptions
 {
-    public int Width { get; init; } = 1280;
-    public int Height { get; init; } = 720;
+    public const int DefaultWidth = 1440;
+    public const int DefaultHeight = 900;
+    public int Width { get; init; } = DefaultWidth;
+    public int Height { get; init; } = DefaultHeight;
     public bool SmartSizing { get; init; } = true;
     public bool Audio { get; init; }
     public bool ShareClipboard { get; init; }
@@ -325,6 +333,7 @@ internal sealed record SeatOptions
     public int? ScaleFactor { get; init; }
     public bool StartViewOnly { get; init; } = true;
     public bool ShowWindow { get; init; } = true;
+    public bool AutoMonitor { get; init; } = true;
     public bool KeepSeatOnExit { get; init; }
     public bool PromptForCredentials { get; init; }
     public bool ConfigureBackgroundRendering { get; init; } = true;

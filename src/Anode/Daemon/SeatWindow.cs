@@ -24,6 +24,7 @@ internal sealed class SeatWindow : Form
     private readonly ToolStripButton _reconnectButton = new();
     private readonly ToolStripButton _signInButton = new();
     private readonly ToolStripButton _detailsButton = new();
+    private readonly ToolStripButton _hideMonitorButton = new();
     private readonly ToolStripLabel _headline = new();
     private readonly StatusStrip _statusBar = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
@@ -40,6 +41,8 @@ internal sealed class SeatWindow : Form
     private readonly Panel _seatArea = new();
     private readonly bool _fitSeat;
     private Size _seatSize;
+    private Size _monitorFitSize;
+    private Rectangle _monitorWorkArea;
     private Control? _standIn;
     private bool _fitted;
     private Icon? _trayIcon;
@@ -50,6 +53,7 @@ internal sealed class SeatWindow : Form
     private Rectangle _restoreBounds;
     private bool _fullScreen;
     private bool _viewOnly = true;
+    private bool _monitorMode;
     private bool _noActivate = true;
     private bool _reallyClosing;
     private bool _hotkeyAvailable;
@@ -146,6 +150,37 @@ internal sealed class SeatWindow : Form
         Location = new Point(work.Right - Width - 24, work.Bottom - Height - 24);
     }
 
+    // Monitor view uses device pixels. The title bar and taskbar take space outside the picture.
+    internal static Size MonitorPictureSize(Size seat, Size available)
+    {
+        double scale = Math.Min(1, Math.Min((double)available.Width / seat.Width, (double)available.Height / seat.Height));
+        return new Size(Math.Max(1, (int)Math.Floor(seat.Width * scale)),
+            Math.Max(1, (int)Math.Floor(seat.Height * scale)));
+    }
+
+    private void FitMonitor(Screen screen)
+    {
+        if (_fullScreen || WindowState != FormWindowState.Normal) return;
+        var work = screen.WorkingArea;
+        if (_monitorFitSize == _seatSize && _monitorWorkArea == work) return;
+        PerformLayout();
+        var chrome = Size - _seatArea.ClientSize;
+        var picture = MonitorPictureSize(_seatSize, work.Size - chrome);
+        _monitorFitSize = _seatSize;
+        _monitorWorkArea = work;
+        Size = new Size(Math.Min(work.Width, Math.Max(MinimumSize.Width, picture.Width + chrome.Width)),
+            Math.Min(work.Height, Math.Max(MinimumSize.Height, picture.Height + chrome.Height)));
+        Location = new Point(Math.Clamp(Left, work.Left, Math.Max(work.Left, work.Right - Width)),
+            Math.Clamp(Top, work.Top, Math.Max(work.Top, work.Bottom - Height)));
+        PlaceSeat();
+    }
+
+    protected override void OnResizeEnd(EventArgs e)
+    {
+        base.OnResizeEnd(e);
+        if (_monitorMode && Visible) FitMonitor(Screen.FromControl(this));
+    }
+
     /// <summary>
     /// Centres the control, at the seat's shape, in the seat area. Smart sizing scales the seat to the control,
     /// so the seat is never padded with the control's own white bars; any other space shows the dark area.
@@ -153,13 +188,19 @@ internal sealed class SeatWindow : Form
     private void PlaceSeat()
     {
         var area = _seatArea.ClientSize;
-        if (!_fitSeat || area.Width <= 0 || area.Height <= 0) return;
-        double scale = Math.Min((double)area.Width / _seatSize.Width, (double)area.Height / _seatSize.Height);
-        int width = Math.Clamp((int)Math.Round(_seatSize.Width * scale), 1, area.Width);
-        int height = Math.Clamp((int)Math.Round(_seatSize.Height * scale), 1, area.Height);
+        if ((!_fitSeat && !_monitorMode) || area.Width <= 0 || area.Height <= 0) return;
+        var picture = _monitorMode ? MonitorPictureSize(_seatSize, area) : FitPicture(_seatSize, area);
+        int width = picture.Width, height = picture.Height;
         var bounds = new Rectangle((area.Width - width) / 2, (area.Height - height) / 2, width, height);
         Viewer.Bounds = bounds;
         if (_standIn is not null) _standIn.Bounds = bounds;
+    }
+
+    private static Size FitPicture(Size seat, Size area)
+    {
+        double scale = Math.Min((double)area.Width / seat.Width, (double)area.Height / seat.Height);
+        return new Size(Math.Clamp((int)Math.Round(seat.Width * scale), 1, area.Width),
+            Math.Clamp((int)Math.Round(seat.Height * scale), 1, area.Height));
     }
 
     /// <summary>The seat's display size, which shapes its picture. The window keeps the size the user gave it.</summary>
@@ -168,6 +209,7 @@ internal sealed class SeatWindow : Form
         if (InvokeRequired) { BeginInvoke(new Action(() => SetSeatSize(width, height))); return; }
         if (width <= 0 || height <= 0) return;
         _seatSize = new Size(width, height);
+        if (_monitorMode && Visible) FitMonitor(Screen.FromControl(this));
         PlaceSeat();
     }
 
@@ -190,6 +232,7 @@ internal sealed class SeatWindow : Form
         get => _viewOnly;
         set
         {
+            if (_monitorMode && !value) return;
             _viewOnly = value;
             Viewer.SetInputEnabled(!value);
             _controlButton.Text = value ? "Take control" : "Release control";
@@ -262,6 +305,13 @@ internal sealed class SeatWindow : Form
             if (_detailsPanel.Visible) _details.Focus();
         };
 
+        _hideMonitorButton.Text = "隐藏画面";
+        _hideMonitorButton.Name = "HideMonitor";
+        _hideMonitorButton.ToolTipText = "隐藏监看窗口，后台任务继续运行。";
+        _hideMonitorButton.Available = false;
+        _hideMonitorButton.Overflow = ToolStripItemOverflow.Never;
+        _hideMonitorButton.Click += (_, _) => HideViewer();
+
         _headline.Alignment = ToolStripItemAlignment.Right;
         _headline.ForeColor = ViewerTheme.Muted;
         _headline.Text = "Starting";
@@ -279,6 +329,7 @@ internal sealed class SeatWindow : Form
             _reconnectButton,
             _signInButton,
             _detailsButton,
+            _hideMonitorButton,
             _headline
         });
         foreach (var button in _toolbar.Items.OfType<ToolStripButton>())
@@ -337,6 +388,7 @@ internal sealed class SeatWindow : Form
         };
 
         var menu = new ContextMenuStrip();
+        menu.Items.Add("实时监看", null, (_, _) => ShowMonitor());
         menu.Items.Add("Show the seat", null, (_, _) => ShowViewer());
         menu.Items.Add(_traySignIn);
         menu.Items.Add("Stop the seat", null, (_, _) => StopSeatRequested?.Invoke());
@@ -458,7 +510,11 @@ internal sealed class SeatWindow : Form
     {
         if (InvokeRequired) { BeginInvoke(new Action(() => SetHeadline(text))); return; }
         _state = text;
-        _headline.Text = text switch
+        _headline.Text = _monitorMode ? text switch
+        {
+            "ready" => "实时画面", "stopped" => "桌面已停止", "detached" => "连接中断",
+            "error" or "logon-error" => "连接失败", "stopping" => "正在停止", _ => "正在连接"
+        } : text switch
         {
             "starting" => "Starting", "connecting" => "Connecting", "signing-in" => "Signing in",
             "starting-agent" => "Preparing desktop", "ready" => "Ready", "stopping" => "Stopping",
@@ -506,6 +562,7 @@ internal sealed class SeatWindow : Form
 
     /// <summary>True once the Remote Desktop control has connected and shows the seat itself.</summary>
     internal bool SeatPictureLive => _seatPictureLive;
+    internal bool MonitorVisible => _monitorMode && Visible;
 
     /// <summary>
     /// Reveals the Remote Desktop control as soon as it connects, whatever the seat then shows,
@@ -528,15 +585,52 @@ internal sealed class SeatWindow : Form
     public void ShowViewer()
     {
         if (InvokeRequired) { BeginInvoke(new Action(ShowViewer)); return; }
+        SetMonitorMode(false);
         Show();
         if (WindowState == FormWindowState.Minimized) WindowState = _restoreState;
         ClearNoActivate();
         Activate();
     }
 
+    internal void ShowMonitor()
+    {
+        // Respect an open viewer, including an explicit handover of mouse control.
+        if (Visible) return;
+        SetMonitorMode(true);
+        FitMonitor(Screen.FromPoint(Cursor.Position));
+        // Reapply the no-activate flag for this show; an earlier connection may have cleared it.
+        _noActivate = true;
+        Native.SetWindowLong(Handle, Native.GWL_EXSTYLE,
+            Native.GetWindowLong(Handle, Native.GWL_EXSTYLE) | Native.WS_EX_NOACTIVATE);
+        try { Show(); }
+        finally { ClearNoActivate(); }
+    }
+
+    private void SetMonitorMode(bool enabled)
+    {
+        if (_monitorMode == enabled) return;
+        _monitorMode = enabled;
+        Text = enabled ? $"{Brand.Name} · 实时监看" : Brand.Name + Env.ChannelSuffix;
+        AccessibleName = Text;
+        if (enabled)
+        {
+            _detailsButton.Checked = false;
+            ViewOnly = true;
+        }
+        else _monitorFitSize = Size.Empty;
+        Viewer.Dock = _fitSeat || enabled ? DockStyle.None : DockStyle.Fill;
+        Viewer.SetSmartSizing(_fitSeat || enabled);
+        foreach (var item in new ToolStripItem[] { _stopButton, _controlButton, _reconnectButton, _signInButton, _detailsButton })
+            item.Available = !enabled;
+        _hideMonitorButton.Available = enabled;
+        _modeLabel.Text = enabled ? "只读监看" : ViewOnly ? "View only" : "You have control";
+        SetHeadline(_state);
+    }
+
     public void HideViewer()
     {
         if (InvokeRequired) { BeginInvoke(new Action(HideViewer)); return; }
+        if (_fullScreen) ToggleFullScreen();
         Hide();
     }
 
@@ -671,8 +765,8 @@ internal sealed class SeatWindow : Form
         if (!_reallyClosing && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
-            if (_fullScreen) ToggleFullScreen();
-            Hide();
+            HideViewer();
+            if (_monitorMode) return;
             _tray.BalloonTipTitle = $"{Brand.Name} is still running";
             _tray.BalloonTipText = "The seat is untouched. Use the tray icon to watch it again or to stop it.";
             _tray.ShowBalloonTip(3000);

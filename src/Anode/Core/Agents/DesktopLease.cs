@@ -179,7 +179,9 @@ internal sealed class DesktopLease
                 _expires = now + _ttl;
                 RememberClient(request);
                 _record($"desktop lease taken by {Label(agent, _ownerName)}");
-                return JsonLine.Ok(State(agent, includeToken: true));
+                var acquired = JsonLine.Ok(State(agent, includeToken: true));
+                acquired["leaseStarted"] = true;
+                return acquired;
             }
             if (Check(request) is { } error) return error;
             if (action == "renew")

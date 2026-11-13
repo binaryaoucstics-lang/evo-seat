@@ -1,14 +1,17 @@
 # EVO Seat
 
-[简体中文](README.md) · [Install for Codex](docs/codex.md) · [Agent workflow](AGENTS.md) · [Releases](https://github.com/binaryaoucstics-lang/evo-seat/releases)
+[简体中文](README.md) · [Install for Codex](docs/codex.md) · [Agent workflow](AGENTS.md) · [Latest release](https://github.com/binaryaoucstics-lang/evo-seat/releases/latest)
 
 EVO Seat gives Codex a hidden Windows desktop for operating and testing real GUI apps. An agent can launch an app, inspect its accessibility tree, send mouse and keyboard input, capture screenshots, and verify changes without taking over your foreground desktop.
 
 - **Observe and act.** Use window IDs, accessibility snapshots, or seat-relative pixels. Pass `observeAfter: true` to `seat_element` to get a fresh snapshot after an intermediate action.
 - **Share the seat.** Use an exclusive lease or choose matching 2, 4, or 12-region layouts for concurrent agents. The seat shares the Windows account and files.
 - **Capture evidence.** Request a full-resolution PNG for small text or combine accessibility data and a screenshot when verifying a receipt.
+- **Watch live.** A read-only monitor opens when a background task takes a new desktop lease. The exclusive desktop defaults to 1440 × 900, and concurrent layouts expand the desktop to fit all regions. The picture stays at native pixel size when it fits and scales down to the current display's work area when needed. Hiding the monitor leaves the task running. Reopen it from the system tray.
 
 For installation, give your Codex agent the [installation guide](docs/codex.md). For operation, give it the [agent workflow](AGENTS.md).
+
+To start a new seat with automatic monitoring disabled, use `--no-monitor` as shown in the [Codex installation guide](docs/codex.md#4-watch-background-tasks).
 
 ## Windows Paint comparison
 
