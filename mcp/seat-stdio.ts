@@ -18,7 +18,7 @@ const channel = process.env.EVO_SEAT_CHANNEL ?? "proto-dual";
 const native = new McpClient({ name: "Codex", version: "1" });
 const transport = new StdioTransport({
   command: executable, args: ["--channel", channel, "mcp"],
-  cwd: process.cwd(), env: { ANODE_EPHEMERAL: "1" }, stderr: "inherit",
+  cwd: process.cwd(), env: { ANODE_EPHEMERAL: "1", ANODE_MCP_DEFAULT_LAYERED: "1" }, stderr: "inherit",
 });
 const readback = new SeatReadback();
 const pending = new Map<JsonRpcId, AbortController>();
@@ -41,7 +41,8 @@ async function handle(request: JsonRpcRequest, signal: AbortSignal) {
           websiteUrl: "https://github.com/binaryaoucstics-lang/evo-seat",
         },
         instructions: [
-          result.instructions,
+          "In Codex, seat_lease acquire defaults to a concurrent region. Omit layerCount so the live layout grows as tasks join. Use mode:exclusive for global tools that need the whole desktop. Release your lease when the task is finished.",
+          result.instructions?.replace("Default mode=exclusive preserves the original shared desktop lease and first-come waiting. ", ""),
           "Use seat_element with observeAfter:true to get a fresh text snapshot after intermediate actions. Verify final submissions separately.",
           "When a transient loading label is visible, use seat_wait for that exact name with state:missing and waitMs:5000. Inspect the result, including when matched is false.",
           "Use seat_screenshot with format:png and no maxWidth when a decision depends on small text. For receipts, seat_observe with includeScreenshot:true returns controls and an image.",
@@ -55,7 +56,15 @@ async function handle(request: JsonRpcRequest, signal: AbortSignal) {
       return native.request(request.method, request.params as Record<string, unknown> | undefined, { signal });
     case "tools/list": {
       const tools = await native.listTools({ signal });
-      return { tools: tools.map(tool => tool.name === "seat_element" ? seatCatalog(tools, tool.name) : tool) };
+      return { tools: tools.map(tool => {
+        if (tool.name === "seat_element") return seatCatalog(tools, tool.name);
+        if (tool.name !== "seat_lease") return tool;
+        const properties = tool.inputSchema.properties as Record<string, object>;
+        return { ...tool, description: tool.description?.replace("The default exclusive mode allows one owner.",
+          "Codex defaults to a concurrent region. Choose exclusive for tools that need the whole desktop."),
+          inputSchema: { ...tool.inputSchema, properties: { ...properties,
+            mode: { ...properties.mode, description: "layered (Codex default) or exclusive. Only acquire. Release your current lease before switching modes." } } } };
+      }) };
     }
     case "tools/call": {
       const params = request.params as { name?: string; arguments?: Record<string, unknown> } | undefined;

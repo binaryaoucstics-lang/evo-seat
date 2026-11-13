@@ -398,7 +398,7 @@ internal sealed class AnodeDaemon : IDisposable
                 SeatLauncher.LaunchInSession(
                     id.Value,
                     Env.ExecutablePath,
-                    $"--channel {Env.Channel} __seat-host --state-dir " + DaemonLauncher.Quote(Env.StateDirectory),
+                    $"--channel {Env.Channel} __seat-launcher --state-dir " + DaemonLauncher.Quote(Env.StateDirectory),
                     AppContext.BaseDirectory);
             }, cancel).ConfigureAwait(false);
 
@@ -1112,7 +1112,7 @@ internal sealed class AnodeDaemon : IDisposable
             if (_stopRequested || !_hostReady) return JsonLine.Fail($"The seat is not ready ({_state}), so there is no display to remember.");
             _display = shown;
         }
-        Log.Info($"the seat shows {shown} after a display change that did not arrive as asked; later viewer connections ask for it");
+        Log.Info($"confirmed the seat display at {shown}");
         _window?.SetSeatSize(shown.Width, shown.Height);
         return JsonLine.Ok(new JsonObject { ["method"] = "record", ["display"] = shown.ToJson() });
     }

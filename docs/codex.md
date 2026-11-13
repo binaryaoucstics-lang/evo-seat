@@ -9,7 +9,7 @@ Run these steps in PowerShell on the Windows machine where Codex will use the de
 This example installs the pinned release into a versioned folder under your user account. Use a new directory if you have already unpacked this version.
 
 ```powershell
-$version = 'v0.2.0'
+$version = 'v0.3.0'
 $download = "https://github.com/binaryaoucstics-lang/evo-seat/releases/download/$version"
 $asset = 'evo-seat-windows-x64.zip'
 $install = Join-Path $env:LOCALAPPDATA "Programs\EVOSeat\$version"
@@ -58,13 +58,15 @@ For long GUI calls, you can set `tool_timeout_sec = 420` under the existing `[mc
 
 ## 3. Verify from a new Codex chat
 
-> Use EVO Seat. Call `seat_status` first and report whether the MCP server responds. Then acquire an exclusive lease, check `seat_capabilities`, and capture one screenshot inside the seat. Release the lease when done.
+> Use EVO Seat. Call `seat_status` first and report whether the MCP server responds. Then acquire a desktop lease with the default settings, check `seat_capabilities`, and capture one screenshot inside the seat. Release the lease when done.
 
 A stopped status is a valid response before acquisition. If acquisition fails, use the error and `doctor` output to diagnose the host. Follow the [agent workflow](../AGENTS.md) for app operations.
 
 ## 4. Watch background tasks
 
 A new desktop lease opens a read-only live window on the foreground desktop. The exclusive seat defaults to 1440 × 900. The window fits concurrent layouts to the display when needed. Use **隐藏画面** (Hide picture) to close the window and **实时监看** (Watch live) in the system tray to reopen it.
+
+For concurrent work, let each Codex chat acquire its own lease with `layerCount` omitted. The third task adds a second row to the live window. The first two keep their original applications and coordinates.
 
 To disable automatic monitoring, use this command before Codex takes its first lease. If a seat process is already running, quit it after its tasks finish before running the command.
 

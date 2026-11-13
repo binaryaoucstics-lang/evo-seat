@@ -15,12 +15,13 @@ internal sealed class LaunchNotStartedException(string message, Exception? cause
 internal static class DetachedProcess
 {
     /// <summary>Returns the process id. A console program gets no console window; a null directory keeps this one's.</summary>
-    public static int Start(string file, IEnumerable<string> arguments, string? directory, Action<int, IntPtr>? beforeResume = null)
+    public static int Start(string file, IEnumerable<string> arguments, string? directory, Action<int, IntPtr>? beforeResume = null,
+        string? desktop = null)
     {
-        var startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>(), Flags = UseStdHandles };
+        var startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>(), Flags = UseStdHandles, Desktop = desktop };
         // CreateProcessW may write to the command line, so it gets a buffer of its own.
         var commandLine = new StringBuilder(string.Join(' ', arguments.Prepend(file).Select(DaemonLauncher.Quote)));
-        if (!CreateProcessW(beforeResume is null ? null : file, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+        if (!CreateProcessW(beforeResume is null && desktop is null ? null : file, commandLine, IntPtr.Zero, IntPtr.Zero, false,
                 CreateNoWindow | (beforeResume is null ? 0u : 4u), IntPtr.Zero, directory,
                 ref startup, out var started))
         {

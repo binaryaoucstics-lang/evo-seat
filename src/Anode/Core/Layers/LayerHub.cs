@@ -5,6 +5,7 @@ using Anode.Core.Agents;
 using Anode.Core.Bridge;
 using Anode.Core.Capture;
 using Anode.Core.Desktop;
+using Anode.Core.Display;
 using Anode.Core.Input;
 using Anode.Core.Session;
 using Anode.Core.Util;
@@ -18,7 +19,6 @@ internal sealed class LayerHub
     {
         public readonly string Id, Token;
         public readonly int Slot;
-        public readonly int LayerCount;
         public readonly LayerWindows Windows;
         public readonly DesktopWorker.Session Worker = new();
         private readonly DesktopWorker.Session _nativeObserver = new();
@@ -26,9 +26,9 @@ internal sealed class LayerHub
         private WindowTarget? _managedOnly;
         private bool _nativeSnapshot;
         public readonly DesktopTools Desktop;
-        public Context(string id, string token, int slot, int layerCount, LayerWindows windows, SemaphoreSlim formReads)
+        public Context(string id, string token, int slot, LayerWindows windows, SemaphoreSlim formReads)
         {
-            Id = id; Token = token; Slot = slot; LayerCount = layerCount; Windows = windows;
+            Id = id; Token = token; Slot = slot; Windows = windows;
             _formReads = formReads;
             Desktop = new(CallWorkerAsync, windows.Bounds, windows.Owns, windows.DescribeWindows);
         }
@@ -89,6 +89,9 @@ internal sealed class LayerHub
     private readonly object _state = new();
     private readonly Dictionary<string, Context> _layers = new();
     private Size _layoutScreen;
+    private Rectangle[] _regions = [];
+    private bool _automaticLayout;
+    private readonly LayerActionGate _layout = new();
     private readonly LayerActionGate _input = new();
     // Concurrent WinForms proxy queries contend in the same Windows desktop.
     // Two permits keep an independent read available if a single provider hangs.
@@ -99,7 +102,7 @@ internal sealed class LayerHub
     {
         lock (_state) return new JsonObject
         {
-            ["count"] = _layers.Values.FirstOrDefault()?.LayerCount ?? 0,
+            ["count"] = _layers.Count == 0 ? 0 : _regions.Length,
             ["owners"] = new JsonArray(_layers.Keys.Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
             ["closing"] = _layers.Values.Count(c => c.Closing is not null),
             ["displayChanged"] = _layers.Count > 0 && _layoutScreen != InputInjector.ScreenSize()
@@ -120,32 +123,46 @@ internal sealed class LayerHub
 
     internal static bool SupportsLayout(int count) => Grid(count).Columns != 0;
 
+    internal static Size DefaultLayoutSize(int count)
+    {
+        var (columns, rows) = Grid(count);
+        return new Size(Daemon.SeatOptions.DefaultWidth * columns, Daemon.SeatOptions.DefaultHeight * rows);
+    }
+
+    internal static bool FitsLayout(Size screen, int count)
+    {
+        var (columns, rows) = Grid(count);
+        return columns > 0 && screen.Width >= 1280 * columns && screen.Height >= 720 * rows;
+    }
+
     internal static Rectangle[] Regions(Size screen, int count)
     {
         var (columns, rows) = Grid(count);
         if (columns == 0) throw new ArgumentException(InvalidLayerCount);
-        if (screen.Width < 1280 * columns || screen.Height < 720 * rows)
+        if (!FitsLayout(screen, count))
             throw new ArgumentException($"{count} layers need at least {1280 * columns}x{720 * rows}. "
                 + $"Start at {1440 * columns}x{900 * rows} for {count} 1440x900 regions.");
         int width = screen.Width / columns, height = screen.Height / rows;
         return Enumerable.Range(0, count).Select(slot => new Rectangle(slot % columns * width, slot / columns * height, width, height)).ToArray();
     }
 
+    internal static Rectangle[] ExpandedRegions(Rectangle[] current, Size size, int count) =>
+        [.. current, .. Regions(size, count).Except(current)];
+
     internal static string[] StartupArguments(int count)
     {
-        var (columns, rows) = Grid(count);
-        return columns == 0 ? ["--hidden"] :
-            ["--hidden", "--width", $"{Daemon.SeatOptions.DefaultWidth * columns}", "--height", $"{Daemon.SeatOptions.DefaultHeight * rows}"];
+        var size = DefaultLayoutSize(count);
+        return size.IsEmpty ? ["--hidden"] : ["--hidden", "--width", $"{size.Width}", "--height", $"{size.Height}"];
     }
 
     public static JsonObject Failure(string code, string message)
     {
         var r = JsonLine.Fail(message); r["errorCode"] = code; return r;
     }
-    private static JsonObject State(Context c, bool token = false) => new()
+    private JsonObject State(Context c, bool token = false) => new()
     {
         ["mode"] = "layered", ["agentId"] = c.Id, ["ownerAgentId"] = c.Id,
-        ["leaseToken"] = token ? c.Token : null, ["slot"] = c.Slot, ["layerCount"] = c.LayerCount,
+        ["leaseToken"] = token ? c.Token : null, ["slot"] = c.Slot, ["layerCount"] = _regions.Length,
         ["expiresInMs"] = Math.Max(0, c.Expires - Environment.TickCount64),
         ["region"] = new JsonObject { ["x"] = c.Windows.Bounds.X, ["y"] = c.Windows.Bounds.Y,
             ["width"] = c.Windows.Bounds.Width, ["height"] = c.Windows.Bounds.Height },
@@ -157,6 +174,53 @@ internal sealed class LayerHub
         return state ?? await closing!.ConfigureAwait(false);
     }
 
+    // The seat host serializes lease acquisition and mode changes. Hold the layout gate
+    // across the live resize so existing actions finish at their old geometry first.
+    internal async Task<JsonObject?> GrowForAcquireAsync(JsonObject request, SeatDisplay display,
+        CancellationToken cancel, CancellationToken stopping)
+    {
+        int next;
+        Size previous;
+        Rectangle[] regions;
+        lock (_state)
+        {
+            if (request.Int("layerCount") is not null || !_automaticLayout || _layers.Count < _regions.Length
+                || _layers.ContainsKey(request.Str("agentId")!) || _layers.Values.Any(layer => layer.Closing is not null)) return null;
+            next = _regions.Length switch { 2 => 4, 4 => 12, _ => 0 };
+            if (next == 0 || InputInjector.ScreenSize() != _layoutScreen) return null;
+            previous = _layoutScreen;
+            regions = _regions;
+        }
+
+        await _layout.EnterAsync(shared: false, cancel).ConfigureAwait(false);
+        try
+        {
+            cancel.ThrowIfCancellationRequested();
+            lock (_state)
+                if (_layers.Count < regions.Length || _layers.Values.Any(layer => layer.Closing is not null)) return null;
+            var size = DefaultLayoutSize(next);
+            // Complete or restore the display change even if the joining client disconnects.
+            var result = await display.SetAsync(new JsonObject { ["width"] = size.Width, ["height"] = size.Height },
+                stopping, liveOnly: true).ConfigureAwait(false);
+            if (InputInjector.ScreenSize() != size)
+            {
+                await display.SetAsync(new JsonObject { ["width"] = previous.Width, ["height"] = previous.Height },
+                    stopping, liveOnly: true).ConfigureAwait(false);
+                return Failure("layer_display", result.Str("error") ?? "Windows could not expand the desktop live.");
+            }
+
+            lock (_state)
+            {
+                // Keep each existing slot and all its pixel coordinates. The new cells follow those slots.
+                _regions = ExpandedRegions(regions, size, next);
+                _layoutScreen = size;
+            }
+            Log.Info($"layer layout expanded from {regions.Length} to {next} at {size.Width}x{size.Height}");
+            return null;
+        }
+        finally { _layout.Exit(shared: false); }
+    }
+
     private (JsonObject? State, Task<JsonObject>? Closing) Manage(JsonObject request)
     {
         lock (_state)
@@ -166,9 +230,10 @@ internal sealed class LayerHub
             _layers.TryGetValue(id, out var c);
             if (action == "acquire")
             {
-                int count = request.Int("layerCount") ?? 2;
+                int? requestedCount = request.Int("layerCount");
+                int count = requestedCount ?? (_layers.Count > 0 ? _regions.Length : 2);
                 if (!SupportsLayout(count)) return (Failure("layer_layout", InvalidLayerCount), null);
-                if (_layers.Count > 0 && _layers.Values.First().LayerCount != count)
+                if (_layers.Count > 0 && _regions.Length != count)
                     return (Failure("layer_layout", "Release all regions before changing the layout."), null);
                 var screen = InputInjector.ScreenSize();
                 if (_layers.Count > 0 && screen != _layoutScreen)
@@ -178,14 +243,17 @@ internal sealed class LayerHub
                 if (c is null)
                 {
                     if (_layers.Count >= count) return (Failure("seat_busy", $"All {count} layers are occupied."), null);
-                    Rectangle[] regions;
-                    try { regions = Regions(screen, count); }
-                    catch (ArgumentException ex) { return (Failure("layer_display", ex.Message), null); }
+                    if (_layers.Count == 0)
+                    {
+                        try { _regions = Regions(screen, count); }
+                        catch (ArgumentException ex) { return (Failure("layer_display", ex.Message), null); }
+                        _layoutScreen = screen;
+                        _automaticLayout = requestedCount is null && screen == DefaultLayoutSize(count);
+                    }
                     int slot = Enumerable.Range(0, count).First(n => _layers.Values.All(layer => layer.Slot != n));
-                    c = new Context(id, "layer_" + Guid.NewGuid().ToString("N"), slot, count,
-                        new LayerWindows(id, regions[slot]), _formReads);
+                    c = new Context(id, "layer_" + Guid.NewGuid().ToString("N"), slot,
+                        new LayerWindows(id, _regions[slot]), _formReads);
                     _layers.Add(id, c);
-                    _layoutScreen = screen;
                     Log.Info($"layer acquired agent={id} slot={slot} layerCount={count}");
                 }
                 c.TtlMs = (request.Int("ttlSeconds") ?? 120) * 1000;
@@ -305,13 +373,14 @@ internal sealed class LayerHub
         double waitMs = 0, activateMs = 0, dispatchMs = 0, restoreMs = 0, cleanupMs = 0;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel, c.Stop.Token);
         deadline.CancelAfter(DesktopLease.StopAfterMs(request.Int("timeoutMs") ?? 60000));
-        bool entered = false, input = false, started = false;
+        bool entered = false, layout = false, input = false, started = false;
         try
         {
             await c.Gate.WaitAsync(deadline.Token).ConfigureAwait(false); entered = true;
+            await _layout.EnterAsync(shared: true, deadline.Token).ConfigureAwait(false); layout = true;
             if (InputInjector.ScreenSize() != _layoutScreen)
                 return Failure("layer_display", "The display changed. Restore the active layout before using coordinates.");
-            if (!Supported(op)) return Failure("layer_unsupported", $"'{op}' is not enabled in the dual-layer prototype. Use the original exclusive mode for global, held-input, audio, display, gamepad and Android operations.");
+            if (!SupportsOperation(op)) return Failure("layer_unsupported", $"'{op}' requires an exclusive desktop lease. Release your region, then acquire mode=exclusive after the other regions finish.");
             if (foreground || valueWrite)
             {
                 await c.WarmAsync(op, deadline.Token).ConfigureAwait(false);
@@ -368,6 +437,7 @@ internal sealed class LayerHub
             }
             finally
             {
+                if (layout) _layout.Exit(shared: true);
                 if (entered) c.Gate.Release();
                 lock (_state) { c.Active--; c.Expires = Environment.TickCount64 + c.TtlMs; }
             }
@@ -386,7 +456,7 @@ internal sealed class LayerHub
         || op == "desktop.window" && request.Str("action") is "focus" or "raise"
         || op == "desktop.element" && !IsValueAction(request);
 
-    private static bool Supported(string op) => op is "screenshot" or "run" or "desktop.windows" or "desktop.observe"
+    internal static bool SupportsOperation(string op) => op is "screenshot" or "run" or "desktop.windows" or "desktop.observe"
         or "desktop.wait" or "desktop.window" or "desktop.element" or "input.move" or "input.click"
         or "input.drag" or "input.scroll" or "input.key" or "input.text" or "input.position" or "clipboard.read" or "clipboard.write"
         or "desktop.launch.status";

@@ -9,7 +9,7 @@
 下列命令将固定版本装入当前账户的版本目录。如已解压过该版本，请换一个新目录。
 
 ```powershell
-$version = 'v0.2.0'
+$version = 'v0.3.0'
 $download = "https://github.com/binaryaoucstics-lang/evo-seat/releases/download/$version"
 $asset = 'evo-seat-windows-x64.zip'
 $install = Join-Path $env:LOCALAPPDATA "Programs\EVOSeat\$version"
@@ -58,13 +58,15 @@ codex mcp get evo-seat
 
 ## 3. 在新的 Codex 对话中验证
 
-> 使用 EVO Seat。先调用 `seat_status` 并报告 MCP 是否响应，再申请独占租约，检查 `seat_capabilities`，在隐藏桌面内截一张图，最后释放租约。
+> 使用 EVO Seat。先调用 `seat_status` 并报告 MCP 是否响应，再用默认参数申请桌面租约，检查 `seat_capabilities`，在隐藏桌面内截一张图，最后释放租约。
 
 申请租约前，返回停止状态也说明连接成功。申请失败时根据工具报错和 `doctor` 的结果排查。后续按 [Agent 操作说明](../AGENTS.md) 操作应用。
 
 ## 4. 监看后台任务
 
 申请新的桌面租约后，前台会自动打开只读实时窗口。独占桌面默认 1440 × 900。并发时，监看窗口会按需缩放以显示全部分区。点击「隐藏画面」收起窗口，可在系统托盘选择「实时监看」重新打开。
+
+并发时，让每个 Codex 对话分别申请租约，省略 `layerCount`。第三个任务加入时，监看窗口会新增一排。前两个任务保留各自的应用和坐标。
 
 要关闭自动监看，请在 Codex 首次申请租约前执行下列命令。如果已有桌面进程在运行，请等任务结束并退出该进程后再执行。
 

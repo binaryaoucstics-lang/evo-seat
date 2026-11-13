@@ -45,6 +45,9 @@ internal sealed class McpServer : IDisposable
     private string? _blockedReason, _seatTaken;
     private bool _launchPending;
     private int _layeredLaunchCount;
+    private readonly bool _defaultLayered = Environment.GetEnvironmentVariable("ANODE_MCP_DEFAULT_LAYERED") == "1";
+    private string? _leaseMode;
+    private int? _requestedLayerCount;
     private int? _leaseTtlSeconds;
     private readonly string _agentId;
     // A generated identity cannot be resumed after this process ends.
@@ -201,6 +204,11 @@ internal sealed class McpServer : IDisposable
             return TextResult($"Unknown tool '{toolName}'.", isError: true);
 
         if (toolName == "anode_guide") return TextResult(AgentGuide.Text);
+        if (_defaultLayered && toolName == "seat_lease" && arguments.Str("action") == "acquire" && !arguments.ContainsKey("mode"))
+        {
+            arguments = (JsonObject)arguments.DeepClone();
+            arguments["mode"] = _leaseMode ?? "layered";
+        }
         if (Tools.ValidateArguments(toolName, arguments) is { } invalid) return TextResult(invalid, true);
         if (toolName == "seat_stop") return await StopAsync(arguments, cancel).ConfigureAwait(false);
         string? leaseAction = toolName == "seat_lease" ? arguments.Str("action") ?? "status" : null;
@@ -234,7 +242,7 @@ internal sealed class McpServer : IDisposable
         string? note = null;
         if (takesLease)
         {
-            if (await TakeLeaseAsync(client, toolName, cancel).ConfigureAwait(false) is { } refused) return refused;
+            if (await TakeLeaseAsync(client, toolName, op, cancel).ConfigureAwait(false) is { } refused) return refused;
             _lookPending = true;
             note = TookLease;
             payload = Envelope(arguments, leaseAction);
@@ -283,8 +291,15 @@ internal sealed class McpServer : IDisposable
             // A new token means the lease this agent held ended, though no call told it so.
             if (_leaseToken is not null && token != _leaseToken) _lookPending = true;
             _leaseToken = token;
+            _leaseMode = result?.Str("mode") ?? "exclusive";
+            if (leaseAction == "acquire") _requestedLayerCount = arguments.Int("layerCount");
         }
-        if (leaseAction == "release") DropLease();
+        if (leaseAction == "release")
+        {
+            DropLease();
+            _leaseMode = null;
+            _requestedLayerCount = null;
+        }
         if (toolName == "seat_status" && result is not null)
         {
             result["agentId"] = _agentId;
@@ -321,13 +336,16 @@ internal sealed class McpServer : IDisposable
     /// Takes the lease for a desktop tool when the desktop is free, so an agent working alone never
     /// manages it. It never starts a seat and never jumps the line: a busy desktop is reported.
     /// </summary>
-    private async Task<JsonObject?> TakeLeaseAsync(JsonPipeClient client, string toolName, CancellationToken cancel)
+    private async Task<JsonObject?> TakeLeaseAsync(JsonPipeClient client, string toolName, string op, CancellationToken cancel)
     {
         var request = Envelope(new JsonObject { ["action"] = "acquire" }, "acquire");
-        if (_layeredLaunchCount > 0)
+        bool layered = _defaultLayered ? _leaseMode != "exclusive" && Core.Layers.LayerHub.SupportsOperation(op)
+            : _layeredLaunchCount > 0;
+        if (layered)
         {
             request["mode"] = "layered";
-            request["layerCount"] = _layeredLaunchCount;
+            if (_requestedLayerCount is int count) request["layerCount"] = count;
+            else if (!_defaultLayered && _layeredLaunchCount > 0) request["layerCount"] = _layeredLaunchCount;
         }
         if (_leaseTtlSeconds is int ttl) request["ttlSeconds"] = ttl;
         request["startSeat"] = false;
@@ -335,6 +353,7 @@ internal sealed class McpServer : IDisposable
         if (response.Bool("ok") == true && response.Obj("result")?.Str("leaseToken") is { } token)
         {
             _leaseToken = token;
+            _leaseMode = response.Obj("result")?.Str("mode") ?? "exclusive";
             return null;
         }
         if (!client.IsConnected && await DaemonAsync(mayStart: false, cancel).ConfigureAwait(false) is null)
@@ -344,6 +363,7 @@ internal sealed class McpServer : IDisposable
         error["structuredContent"] = response.DeepClone();
         return error;
     }
+
 
     /// <summary>
     /// Asks for the desktop about once a second until it is granted or the wait ends. Each ask keeps

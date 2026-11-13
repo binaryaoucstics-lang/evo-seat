@@ -37,6 +37,10 @@ internal static class LayerChecks
             && twelve[11].Location == new Point(4320, 1800) && twelve.All(r => r.Size == new Size(1440, 900)), "Twelve-region placement is incorrect.");
         Require(quad.All(r => quad.Count(other => r.IntersectsWith(other)) == 1)
             && twelve.All(r => twelve.Count(other => r.IntersectsWith(other)) == 1), "Regions overlap.");
+        var grownQuad = LayerHub.ExpandedRegions(dual, new Size(2880, 1800), 4);
+        var grownTwelve = LayerHub.ExpandedRegions(grownQuad, new Size(5760, 2700), 12);
+        Require(grownQuad.SequenceEqual(quad) && grownTwelve.Take(4).SequenceEqual(quad)
+            && grownTwelve.ToHashSet().SetEquals(twelve), "Growing the layout moved an existing slot or lost a cell.");
         foreach (int count in new[] { 0, 1, 3, 5, 11, 13 })
         {
             bool refused = false;

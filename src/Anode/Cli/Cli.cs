@@ -45,7 +45,7 @@ internal static partial class Cli
         }
 
         // Resolve before any role logs, including scheduled and elevated launches.
-        if (command is "up" or "start" or "rendering" or "__seat-host" or "__apply-setup" or "__log-probe")
+        if (command is "up" or "start" or "rendering" or "__seat-host" or "__seat-launcher" or "__apply-setup" or "__log-probe")
         {
             try
             {
@@ -63,6 +63,8 @@ internal static partial class Cli
         // Internal roles run before anything touches the console.
         switch (command)
         {
+            case "__seat-launcher":
+                return Seat.SeatHost.Run(launcher: true);
             case "__seat-host":
                 return Seat.SeatHost.Run();
             case "__desktop-worker":

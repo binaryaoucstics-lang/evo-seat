@@ -49,11 +49,10 @@ internal static class SeatHost
     /// <summary>The user's own session, as the parent daemon reported it; Steam belongs there.</summary>
     private static uint? _desktopSession;
 
-    public static int Run()
+    public static int Run(bool launcher = false)
     {
         Log.SetRole("seat");
         uint session = ChildSession.CurrentSessionId();
-        Log.Info($"seat host starting in session {session} (pid {System.Environment.ProcessId})");
         // Screenshots and input use the seat's physical pixels at every scale, as the desktop worker's bounds do.
         if (!SeatDisplay.UsePhysicalPixels()) Log.Warn("could not make the seat host DPI aware; above 100% scaling, screenshots and input use DPI-scaled coordinates");
 
@@ -71,6 +70,19 @@ internal static class SeatHost
                 $"anode seat host must run inside the child session. This process is in session {session}.");
             return 3;
         }
+
+        try
+        {
+            if (launcher) return SeatDesktop.LaunchHost();
+            SeatDesktop.VerifyHostDesktop();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("could not open the EVO Seat desktop", ex);
+            return 4;
+        }
+
+        Log.Info($"seat host starting on its own desktop in session {session} (pid {System.Environment.ProcessId})");
 
         // Virtual controllers plugged in while the seat runs stay in the seat when HidHide is installed.
         try
@@ -158,6 +170,8 @@ internal static class SeatHost
         }
         if (AgentAccess.Validate(request) is { } invalid) return JsonLine.Fail(invalid);
         string op = request.Str("op") ?? "";
+        if (AgentAccess.RequiresLease(op) && !SeatDesktop.IsActive())
+            return JsonLine.Fail("The EVO Seat desktop is not active. Reconnect its viewer before continuing.");
         if (Mcp.Tools.ValidateOperation(op, AgentAccess.Arguments(request)) is { } badArgs) return JsonLine.Fail(badArgs);
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(DesktopStopping.Token, connection);
         if (op == "lease")
@@ -167,7 +181,8 @@ internal static class SeatHost
             try
             {
                 Layers.ExpireIdle();
-                if (Layers.Contains(request.Str("agentId")) && request.Str("action") == "acquire" && request.Str("mode") == "exclusive")
+                bool acquiring = request.Str("action") == "acquire";
+                if (Layers.Contains(request.Str("agentId")) && acquiring && request.Str("mode") == "exclusive")
                     return LayerHub.Failure("seat_busy", "Release your layer before switching to exclusive mode.");
                 bool layered = request.Str("mode") == "layered" || Layers.Contains(request.Str("agentId"));
                 if (layered)
@@ -176,13 +191,36 @@ internal static class SeatHost
                     var owner = await Lease.HandleAsync(status, HandleOwnedAsync, cancel.Token).ConfigureAwait(false);
                     if (owner.Obj("result")?.Str("ownerAgentId") is not null)
                         return LayerHub.Failure("seat_busy", "The original exclusive desktop is held; release it before acquiring layers.");
+                    int count = request.Int("layerCount") ?? 2;
+                    if (acquiring && !Layers.Any && LayerHub.SupportsLayout(count))
+                    {
+                        if (await Display.RestoredAsync(cancel.Token, request).ConfigureAwait(false) is { } restoring)
+                            return restoring;
+                        var screen = InputInjector.ScreenSize();
+                        var size = LayerHub.DefaultLayoutSize(count);
+                        if (!LayerHub.FitsLayout(screen, count) || (request.Int("layerCount") is null && screen != size))
+                        {
+                            var resized = await Display.SetAsync(new JsonObject { ["width"] = size.Width, ["height"] = size.Height },
+                                cancel.Token).ConfigureAwait(false);
+                            if (!LayerHub.FitsLayout(InputInjector.ScreenSize(), count)) return resized;
+                        }
+                    }
+                    if (acquiring && await Layers.GrowForAcquireAsync(request, Display, cancel.Token, DesktopStopping.Token).ConfigureAwait(false) is { } growthError)
+                        return growthError;
+                    cancel.Token.ThrowIfCancellationRequested();
                     layerChange = Layers.ManageAsync(request);
                 }
                 else
                 {
-                    if (Layers.Any && request.Str("action") == "acquire")
+                    if (Layers.Any && acquiring)
                         return LayerHub.Failure("seat_busy", "Layered agents are active; exclusive mode becomes available after all layers are released.");
-                    return await Lease.HandleAsync(request, HandleOwnedAsync, cancel.Token).ConfigureAwait(false);
+                    var result = await Lease.HandleAsync(request, HandleOwnedAsync, cancel.Token).ConfigureAwait(false);
+                    if (acquiring && result.Bool("leaseStarted") == true)
+                    {
+                        Display.EndLease();
+                        await Display.RestoredAsync(cancel.Token).ConfigureAwait(false);
+                    }
+                    return result;
                 }
             }
             finally { ModeGate.Release(); }

@@ -40,7 +40,7 @@ internal static class Tools
             + "Ownership coordinates trusted agents under the same Windows account; it does not isolate files or applications.",
             Schema(("action", "string", "status (default), acquire, renew, or release.", false),
                 ("mode", "string", "exclusive (default) or layered prototype. Only acquire; cannot mix active exclusive and layered owners.", false),
-                ("layerCount", "integer", "2 (default), 4, or 12 regions. Only acquire with mode=layered. Twelve starts at 5760x2700 and needs at least 5120x2160 on an already-running seat. Release all regions before changing layout.", false),
+                ("layerCount", "integer", "2, 4, or 12 regions. Only acquire with mode=layered. Omit for automatic expansion, or to join the active layout.", false),
                 ("ttlSeconds", "integer", "Lease lifetime after your last desktop action, 10-600 seconds; default 120. Only acquire/renew.", false),
                 ("waitSeconds", "integer", "How long acquire waits in line for another agent to finish, 0-300 seconds; default 30. Only acquire.", false),
                 ("cancelJobs", "boolean", "Cancel your running command jobs on release. Default false; only release.", false))

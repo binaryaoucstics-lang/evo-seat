@@ -145,7 +145,7 @@ internal sealed class SeatDisplay
     /// display the seat shows afterwards. A change Windows did not make, fully or at all, is a failure that
     /// still reports the actual display.
     /// </summary>
-    public async Task<JsonObject> SetAsync(JsonObject args, CancellationToken cancel)
+    public async Task<JsonObject> SetAsync(JsonObject args, CancellationToken cancel, bool liveOnly = false)
     {
         var clock = Stopwatch.StartNew();
         var before = _measure();
@@ -165,12 +165,12 @@ internal sealed class SeatDisplay
         var after = before;
         if (target != before)
         {
-            (after, method, failure, unconfirmed) = await ApplyAsync(before, target, cancel).ConfigureAwait(false);
+            (after, method, failure, unconfirmed) = await ApplyAsync(before, target, cancel, liveOnly).ConfigureAwait(false);
         }
         lock (_gate) _changed = after != startup || unconfirmed;
         // The daemon's viewer asks for the requested display again on every later connection. When the seat shows
         // another one, the daemon learns which, so a Reconnect or sign-in never brings back a change that failed.
-        if (target != before && after != target && !unconfirmed) await RememberAsync(after).ConfigureAwait(false);
+        if (target != before && !unconfirmed && (after != target || liveOnly)) await RememberAsync(after).ConfigureAwait(false);
 
         var result = Describe(after, before, startup, target, method, reset, clock.ElapsedMilliseconds);
         if (after == target) return JsonLine.Ok(result);
@@ -186,7 +186,8 @@ internal sealed class SeatDisplay
     // reconnect at the old display after a failed one, a change stays within the 175 s clients allow seat_display.
     private const int LiveTimeoutMs = 10_000, ReconnectTimeoutMs = 65_000;
 
-    private async Task<(DisplayMode After, string Method, string? Failure, bool Unconfirmed)> ApplyAsync(DisplayMode before, DisplayMode target, CancellationToken cancel)
+    private async Task<(DisplayMode After, string Method, string? Failure, bool Unconfirmed)> ApplyAsync(DisplayMode before, DisplayMode target,
+        CancellationToken cancel, bool liveOnly)
     {
         var live = await AskAsync(target, "live", LiveTimeoutMs, cancel).ConfigureAwait(false);
         if (Unconfirmed(live)) return (_measure(), "live", Why(live!) + " The request may still finish; observe the display again before acting.", true);
@@ -196,6 +197,7 @@ internal sealed class SeatDisplay
         if (live is null && now != before) return (now, "live", null, false);
 
         string notLive = "Windows did not apply it live" + (live is null ? "." : $" ({Why(live)}).");
+        if (liveOnly) return (now, "live", notLive, false);
         _record($"the seat's display did not change live to {target}{(live is null ? "" : $" ({Why(live)})")}; reconnecting the viewer at the new size");
         var reconnect = await AskAsync(target, "reconnect", ReconnectTimeoutMs, cancel).ConfigureAwait(false);
         if (Unconfirmed(reconnect)) return (_measure(), "reconnect", Why(reconnect!) + " The request may still finish; observe the display again before acting.", true);
