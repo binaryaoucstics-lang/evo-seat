@@ -8,11 +8,35 @@ EVO Seat 为 Codex 提供一个隐藏的 Windows 桌面。Agent 可以在里面�
 - **多 Agent 协作。** 支持独占租约，以及 2、4 或 12 个分区。各分区共享 Windows 账户和文件。
 - **留存操作证据。** 看小字时可取原始尺寸 PNG，核对回执时可同时获取控件数据和截图。
 
-下图由 Codex 调用 EVO Seat，在 Windows 画图里逐笔绘制，并保存为 1000 × 410 的 PNG。
+把[安装教程](docs/codex.zh-CN.md)交给 Codex 即可开始安装。安装后，让 Agent 按[操作说明](AGENTS.md)使用隐藏桌面。
+
+## Windows 画图实测对比
+
+两次都使用 **`gpt-6.1-sol`，推理强度为 `high`**，从空白画布开始绘制鹈鹕，保存为 1000 × 410 的 PNG。EVO Seat 使用隐藏桌面，内置 Computer Use 使用前台的画图窗口。
+
+| 实测指标 | EVO Seat | 内置 Computer Use |
+| --- | ---: | ---: |
+| 从回合开始到保存 PNG | 5 分 24.4 秒 | 4 分 42.6 秒 |
+| 完整回合耗时（到最终回复） | 5 分 36.3 秒 | 5 分 03.8 秒 |
+| 总 Token（含缓存输入） | 6,002,040 | 14,759,395 |
+| 缓存输入 Token | 5,961,856 | 14,652,288 |
+| 未缓存输入 Token | 33,205 | 102,239 |
+| 输出 Token（含推理） | 6,979 | 4,868 |
+| Codex 发出的工具调用 | 44 | 62 |
+| 桌面 API 调用 | 306 | 114 |
+| 拖动画笔次数 | 208 | 32 |
+
+时间取自 Codex 回合日志和 PNG 写入时间。Token 汇总各自回合内的所有模型请求，包含随请求发送的对话历史。Codex 工具调用包含等待批处理等调度调用。桌面 API 调用按实际执行次数计算，包括脚本内部的 EVO Seat `seat_*` MCP 调用和内置 Computer Use 的 `sky` API 调用。
+
+本次内置 Computer Use 提前 41.8 秒保存 PNG，总 Token 约为 EVO Seat 的 2.46 倍。EVO Seat 将更多短笔画分批执行，内置版每次操作后刷新窗口，且开始时已有更长的对话历史。表格记录的是这两次实际流程，笔画数量和上下文长度并未统一。
+
+**EVO Seat**
 
 ![用 EVO Seat 在 Windows 画图中画出的鹈鹕](docs/images/pelican.png)
 
-把[安装教程](docs/codex.zh-CN.md)交给 Codex 即可开始安装。安装后，让 Agent 按[操作说明](AGENTS.md)使用隐藏桌面。
+**内置 Computer Use**
+
+![用内置 Computer Use 在 Windows 画图中画出的鹈鹕](docs/images/computer-use-pelican.png)
 
 ## 从源码构建
 

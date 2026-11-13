@@ -8,11 +8,35 @@ EVO Seat gives Codex a hidden Windows desktop for operating and testing real GUI
 - **Share the seat.** Use an exclusive lease or choose matching 2, 4, or 12-region layouts for concurrent agents. The seat shares the Windows account and files.
 - **Capture evidence.** Request a full-resolution PNG for small text or combine accessibility data and a screenshot when verifying a receipt.
 
-The pelican below was drawn stroke by stroke in Windows Paint through Codex and EVO Seat, then saved as a 1000 × 410 PNG.
+For installation, give your Codex agent the [installation guide](docs/codex.md). For operation, give it the [agent workflow](AGENTS.md).
+
+## Windows Paint comparison
+
+Both runs used **`gpt-6.1-sol` with `high` reasoning effort**. Each started with a blank Windows Paint canvas and saved a 1000 × 410 PNG. EVO Seat used a hidden desktop. Built-in Computer Use used the foreground Paint window.
+
+| Measured in Codex | EVO Seat | Built-in Computer Use |
+| --- | ---: | ---: |
+| Time from turn start to PNG save | 5m 24.4s | 4m 42.6s |
+| Full turn, through the final reply | 5m 36.3s | 5m 03.8s |
+| Total tokens, including cached input | 6,002,040 | 14,759,395 |
+| Cached input tokens | 5,961,856 | 14,652,288 |
+| Uncached input tokens | 33,205 | 102,239 |
+| Output tokens, including reasoning | 6,979 | 4,868 |
+| Tool calls issued by Codex | 44 | 62 |
+| Desktop API calls | 306 | 114 |
+| Drag strokes | 208 | 32 |
+
+Times use the Codex turn log and PNG write timestamps. Token counts sum all model requests in each turn, including the conversation history sent with those requests. Codex tool calls include orchestration, such as waiting for an ongoing batch. Desktop API calls count individual `seat_*` MCP calls for EVO Seat and `sky` API calls for built-in Computer Use, including calls inside scripts.
+
+Built-in Computer Use saved its PNG 41.8 seconds sooner and used about 2.46× as many total tokens. The EVO Seat run batched more short strokes, while the built-in run refreshed the window after each action and started with more conversation history. These are two observed runs with different stroke counts and context sizes, so the table describes those workflows.
+
+**EVO Seat**
 
 ![Pelican drawn in Windows Paint using EVO Seat](docs/images/pelican.png)
 
-For installation, give your Codex agent the [installation guide](docs/codex.md). For operation, give it the [agent workflow](AGENTS.md).
+**Built-in Computer Use**
+
+![Pelican drawn in Windows Paint using built-in Computer Use](docs/images/computer-use-pelican.png)
 
 ## Build from source
 
