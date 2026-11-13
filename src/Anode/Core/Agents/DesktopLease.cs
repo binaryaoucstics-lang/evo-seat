@@ -231,7 +231,7 @@ internal sealed class DesktopLease
     }
 
     public async Task<JsonObject> HandleAsync(JsonObject request,
-        Func<JsonObject, CancellationToken, Task<JsonObject>> dispatch, CancellationToken cancel = default)
+        Func<JsonObject, CancellationToken, Task<JsonObject>> dispatch, CancellationToken cancel = default, bool requireLease = false)
     {
         long arrived = _milliseconds();
         if (AgentAccess.Validate(request) is { } invalid) return JsonLine.Fail(invalid);
@@ -239,7 +239,7 @@ internal sealed class DesktopLease
         if (Mcp.Tools.ValidateOperation(op, AgentAccess.Arguments(request)) is { } badArgs) return JsonLine.Fail(badArgs);
         cancel.ThrowIfCancellationRequested();
         if (op == "lease") return Manage(request);
-        if (!AgentAccess.RequiresLease(op)) return await dispatch(request, cancel).ConfigureAwait(false);
+        if (!requireLease && !AgentAccess.RequiresLease(op)) return await dispatch(request, cancel).ConfigureAwait(false);
         lock (_state) { if (Check(request) is { } error) return error; }
 
         int timeoutMs = request.Int("timeoutMs") ?? 60000;

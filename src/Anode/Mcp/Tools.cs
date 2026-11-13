@@ -2,6 +2,8 @@ using System.Text.Json.Nodes;
 using System.Text.Json;
 using Anode.Core.Bridge;
 using Anode.Core.Agents;
+using Anode.Core.Desktop;
+using Anode.Core.Input;
 using Anode.Core.Layers;
 using Anode.Core.Util;
 
@@ -30,7 +32,8 @@ internal static class Tools
         new("seat_lease", "Anode: acquire, renew or release the desktop lease", "lease", false, Effect.Action,
             "Coordinate agents sharing Anode's background Windows desktop (the seat). The default exclusive mode allows one owner. "
             + "Prototype mode=layered on acquire assigns an independent region. Choose 2 (default), 4 (2x2), or 12 (4x3) regions. All active clients must request the same count. Observations can overlap and real input takes short turns. Release closes only this layer's registered apps. Global and held-input operations are unavailable in layered mode. "
-            + "Desktop tools take the lease for you when the desktop is free, and each desktop action keeps it for ttlSeconds more. "
+            + "Only use mode=foreground when the user explicitly asks to operate the main Windows desktop. It needs its own lease and leaves the background regions available. "
+            + "Background desktop tools take the lease for you when the desktop is free, and each desktop action keeps it for ttlSeconds more. "
             + "action=acquire starts a hidden seat if needed; when another agent has the desktop it waits up to waitSeconds (default 30) "
             + "in a first-come line, and calling it again within 5 s keeps your place. action=renew extends the lease while you think without acting. "
             + "action=release hands the desktop to the next agent; release when you finish, optionally cancelling only your command jobs. "
@@ -39,12 +42,12 @@ internal static class Tools
             + "A stable ANODE_AGENT_ID keeps the lease until expiry or release so a restarted session can resume; choose a short ttlSeconds if it may be killed. "
             + "Ownership coordinates trusted agents under the same Windows account; it does not isolate files or applications.",
             Schema(("action", "string", "status (default), acquire, renew, or release.", false),
-                ("mode", "string", "exclusive (default) or layered prototype. Only acquire; cannot mix active exclusive and layered owners.", false),
+                ("mode", "string", "exclusive or layered for the background seat. Choose foreground only when asked to use the Windows main desktop. One foreground lease is independent of all background regions. Only acquire.", false),
                 ("layerCount", "integer", "2, 4, or 12 regions. Only acquire with mode=layered. Omit for automatic expansion, or to join the active layout.", false),
                 ("ttlSeconds", "integer", "Lease lifetime after your last desktop action, 10-600 seconds; default 120. Only acquire/renew.", false),
                 ("waitSeconds", "integer", "How long acquire waits in line for another agent to finish, 0-300 seconds; default 30. Only acquire.", false),
                 ("cancelJobs", "boolean", "Cancel your running command jobs on release. Default false; only release.", false))
-                .OneOf("action", "status", "acquire", "renew", "release").OneOf("mode", "exclusive", "layered")),
+                .OneOf("action", "status", "acquire", "renew", "release").OneOf("mode", "exclusive", "layered", ForegroundHost.Mode)),
 
         new("anode_guide", "Anode: choose tools for background Windows automation", "local.guide", false, Effect.ReadOnly,
             "Learn when to prefer Anode for background Windows desktop automation, native GUI work and headed app/browser testing. "
@@ -337,14 +340,17 @@ internal static class Tools
                 ("dy", "integer", "Relative move instead of absolute.", false))),
 
         new("seat_drag", "Anode: mouse drag", "input.drag", false, Effect.Action,
-            "Press a mouse button at one point in the seat, move to another, and release.",
+            "Hold the mouse button down while following a path, then release once. "
+            + "Pass fromX/fromY/toX/toY for a straight drag, or points for a continuous stroke through 2–128 waypoints. "
+            + "Short segments use fewer moves automatically. Use screenshot coordinates and keep the route inside the target window.",
             Schema(
                 ("windowId", "string", "Exact target window from seat_windows. Recommended in partitions.", false),
-                ("fromX", "integer", "Start X.", true),
-                ("fromY", "integer", "Start Y.", true),
-                ("toX", "integer", "End X.", true),
-                ("toY", "integer", "End Y.", true),
-                ("button", "string", "left (default), right or middle.", false))),
+                ("fromX", "integer", "Start X. Supply all four endpoints together.", false),
+                ("fromY", "integer", "Start Y.", false),
+                ("toX", "integer", "End X.", false),
+                ("toY", "integer", "End Y.", false),
+                ("points", "array", "Ordered {x, y} waypoints. Use instead of the four endpoint fields.", false),
+                ("button", "string", "left (default), right or middle.", false)).DragPoints()),
 
         new("seat_scroll", "Anode: scroll the mouse wheel", "input.scroll", false, Effect.Action,
             "Scroll the wheel in the seat. Negative scrolls down. Returns once the screen settles (up to about 2.5 s), reporting screen.",
@@ -510,6 +516,12 @@ internal static class Tools
         if (name == "seat_audio_play") return Core.Audio.AudioClip.ValidateSource(arguments);
         if (name == "seat_key") return Core.Input.KeyCodes.ChordProblem(arguments.Str("keys")!);
         bool Has(string field) => arguments.ContainsKey(field);
+        if (name == "seat_drag")
+        {
+            int endpoints = new[] { "fromX", "fromY", "toX", "toY" }.Count(Has);
+            if (Has("points") ? endpoints != 0 : endpoints != 4)
+                return "Provide either points or all four fields fromX, fromY, toX and toY.";
+        }
         if (name == "seat_clipboard_write" && arguments.Str("text")!.Length > 1000000)
             return "Clipboard text is limited to 1000000 UTF-16 characters.";
         if (name == "seat_lease")
@@ -677,9 +689,14 @@ internal static class Tools
                 else if (schema["additionalProperties"]?.ToString() == "false") return $"Unknown argument '{path}.{key}'.";
             }
         }
-        if (value is JsonArray array && schema["items"] is JsonObject itemSchema)
-            for (int i = 0; i < array.Count; i++)
-                if (ValidateValue(array[i], itemSchema, $"{path}[{i}]") is { } error) return error;
+        if (value is JsonArray array)
+        {
+            if (schema.Int("minItems") is int minItems && array.Count < minItems) return $"{path} needs at least {minItems} items.";
+            if (schema.Int("maxItems") is int maxItems && array.Count > maxItems) return $"{path} allows at most {maxItems} items.";
+            if (schema["items"] is JsonObject itemSchema)
+                for (int i = 0; i < array.Count; i++)
+                    if (ValidateValue(array[i], itemSchema, $"{path}[{i}]") is { } error) return error;
+        }
         return null;
     }
 
@@ -750,6 +767,18 @@ internal static class Tools
     {
         schema["properties"]!["values"]!["items"] = Schema(("elementId", "string", "Control ID from the observation.", true),
             ("value", "string", "Replacement text.", true));
+        return schema;
+    }
+
+    private static JsonObject DragPoints(this JsonObject schema)
+    {
+        var points = schema["properties"]!["points"]!;
+        points["items"] = Schema(("x", "integer", "X coordinate in screenshot pixels.", true),
+            ("y", "integer", "Y coordinate in screenshot pixels.", true));
+        points["minItems"] = 2;
+        points["maxItems"] = DragPath.MaxPoints;
+        schema["oneOf"] = new JsonArray(new JsonObject { ["required"] = new JsonArray("points") },
+            new JsonObject { ["required"] = new JsonArray("fromX", "fromY", "toX", "toY") });
         return schema;
     }
 

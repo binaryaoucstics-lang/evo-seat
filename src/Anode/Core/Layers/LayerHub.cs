@@ -609,11 +609,16 @@ internal sealed class LayerHub
                 if (!OnTarget(at)) return Failure("layer_target", "The actual window at that point is not owned by your layer.");
                 InputInjector.MoveTo(at.X, at.Y); c.Pointer = new Point(x, y); break;
             case "input.drag":
-                var from = LocalPoint(c, r.Int("fromX")!.Value, r.Int("fromY")!.Value);
-                var to = LocalPoint(c, r.Int("toX")!.Value, r.Int("toY")!.Value);
-                if (!OnTarget(from) || !OnTarget(to)) return Failure("layer_target", "Drag endpoints must hit your registered windows.");
-                InputInjector.Drag(from.X, from.Y, to.X, to.Y, r.Str("button") ?? "left", r.Int("steps") ?? 24, r.Int("stepMs") ?? 8, cancel,
-                    () => c.Windows.IsForegroundOwned(selected), OnTarget); c.Pointer = new(to.X-c.Windows.Bounds.X,to.Y-c.Windows.Bounds.Y); break;
+            {
+                var points = DragPath.Read(r);
+                var screenPoints = points.Select(point => LocalPoint(c, point.X, point.Y)).ToArray();
+                if (screenPoints.Any(point => !OnTarget(point)))
+                    return Failure("layer_target", "Each drag waypoint must hit your registered window. No mouse input was sent.");
+                InputInjector.Drag(screenPoints, r.Str("button") ?? "left", cancel,
+                    () => c.Windows.IsForegroundOwned(selected), OnTarget);
+                c.Pointer = points[^1];
+                break;
+            }
             case "input.scroll":
                 at = LocalPoint(c, c.Pointer.X, c.Pointer.Y);
                 if (!OnTarget(at)) return Failure("layer_target", "Scroll target is not owned by your layer; move to your window first.");

@@ -42,6 +42,7 @@ internal sealed class McpServer : IDisposable
     internal const int DefaultWaitSeconds = 30;
 
     private JsonPipeClient? _daemon;
+    private JsonPipeClient? _foreground;
     private string? _blockedReason, _seatTaken;
     private bool _launchPending;
     private int _layeredLaunchCount;
@@ -177,7 +178,8 @@ internal sealed class McpServer : IDisposable
         if (_leaseToken is null) return;
         try
         {
-            using var client = await JsonPipeClient.TryConnectAsync(_controlPipe, 1000).ConfigureAwait(false);
+            using var client = _leaseMode == ForegroundHost.Mode ? _foreground
+                : await JsonPipeClient.TryConnectAsync(_controlPipe, 1000).ConfigureAwait(false);
             if (client is null) return;
             // An action the session cancelled may still be finishing in the seat; the release waits briefly for it.
             for (int attempt = 0; attempt < 4; attempt++)
@@ -207,11 +209,26 @@ internal sealed class McpServer : IDisposable
         if (_defaultLayered && toolName == "seat_lease" && arguments.Str("action") == "acquire" && !arguments.ContainsKey("mode"))
         {
             arguments = (JsonObject)arguments.DeepClone();
-            arguments["mode"] = _leaseMode ?? "layered";
+            arguments["mode"] = "layered";
         }
         if (Tools.ValidateArguments(toolName, arguments) is { } invalid) return TextResult(invalid, true);
-        if (toolName == "seat_stop") return await StopAsync(arguments, cancel).ConfigureAwait(false);
         string? leaseAction = toolName == "seat_lease" ? arguments.Str("action") ?? "status" : null;
+        bool foreground = (leaseAction == "acquire" ? arguments.Str("mode") : _leaseMode) == ForegroundHost.Mode;
+        if (leaseAction == "acquire" && _leaseToken is not null && foreground != (_leaseMode == ForegroundHost.Mode))
+            return TextResult("Release your current desktop lease before switching between foreground and background.", true);
+        if (foreground)
+        {
+            if (!ForegroundHost.Supports(op)) return TextResult($"'{toolName}' is unavailable in foreground mode.", true);
+            if (_leaseToken is null && leaseAction == "release")
+            {
+                _leaseMode = null;
+                return TextResult("Foreground mode left. The next desktop lease defaults to the background.");
+            }
+            if (_leaseToken is null && leaseAction is not ("acquire" or "status") && op != "status")
+                return TextResult("Explicitly acquire mode=foreground again and observe before using the main desktop.", true);
+            if (leaseAction == "acquire") _leaseMode = ForegroundHost.Mode;
+        }
+        if (toolName == "seat_stop") return await StopAsync(arguments, cancel).ConfigureAwait(false);
         if (leaseAction == "acquire")
         {
             _layeredLaunchCount = arguments.Str("mode") == "layered" ? arguments.Int("layerCount") ?? 2 : 0;
@@ -221,6 +238,8 @@ internal sealed class McpServer : IDisposable
         // A missing lease for a desktop tool is taken below when the desktop is free; everything
         // else is checked before any daemon starts.
         bool takesLease = leaseGated && _leaseToken is null;
+        if (_defaultLayered && takesLease && !Core.Layers.LayerHub.SupportsOperation(op))
+            return TextResult($"'{toolName}' needs the whole background desktop. Explicitly acquire seat_lease with mode=exclusive before using it.", true);
         var payload = Envelope(arguments, leaseAction);
         payload["op"] = op;
         if (!takesLease && AgentAccess.Validate(payload) is { } invalidOwner) return TextResult(invalidOwner, true);
@@ -228,7 +247,22 @@ internal sealed class McpServer : IDisposable
         // Only an explicit start or lease acquisition may create a seat. A cached token must not
         // relaunch a daemon the user quit, only for the new seat to refuse that token.
         bool mayStart = (startsDaemon && !leaseGated) || leaseAction == "acquire";
-        var client = await DaemonAsync(mayStart, cancel).ConfigureAwait(false);
+        JsonPipeClient? client;
+        if (foreground)
+        {
+            try
+            {
+                if (_foreground is not { IsConnected: true })
+                {
+                    _foreground?.Dispose();
+                    _foreground = await ForegroundHost.ConnectAsync(leaseAction == "acquire", cancel).ConfigureAwait(false);
+                }
+                client = _foreground;
+            }
+            catch (InvalidOperationException ex) { return TextResult(ex.Message, true); }
+            if (client is null) return TextResult("The foreground desktop host is unavailable. Explicitly acquire mode=foreground to start it.", true);
+        }
+        else client = await DaemonAsync(mayStart, cancel).ConfigureAwait(false);
         if (client is null)
         {
             if (mayStart)
@@ -264,7 +298,7 @@ internal sealed class McpServer : IDisposable
         {
             // Anode quit since the previous call. Report that rather than a lost connection; the
             // request is never resent, and the agent observes again after acquiring.
-            if (!client.IsConnected && !mayStart && await DaemonAsync(mayStart: false, cancel).ConfigureAwait(false) is null)
+            if (!foreground && !client.IsConnected && !mayStart && await DaemonAsync(mayStart: false, cancel).ConfigureAwait(false) is null)
             {
                 var unavailable = Unavailable(toolName, leaseAction, leaseGated, daemonRunning: false);
                 unavailable["structuredContent"] = response.DeepClone();
@@ -290,8 +324,9 @@ internal sealed class McpServer : IDisposable
             string? token = result?.Str("leaseToken");
             // A new token means the lease this agent held ended, though no call told it so.
             if (_leaseToken is not null && token != _leaseToken) _lookPending = true;
+            if (foreground && leaseAction == "acquire") _lookPending = true;
             _leaseToken = token;
-            _leaseMode = result?.Str("mode") ?? "exclusive";
+            _leaseMode = foreground ? ForegroundHost.Mode : result?.Str("mode") ?? "exclusive";
             if (leaseAction == "acquire") _requestedLayerCount = arguments.Int("layerCount");
         }
         if (leaseAction == "release")
@@ -339,8 +374,7 @@ internal sealed class McpServer : IDisposable
     private async Task<JsonObject?> TakeLeaseAsync(JsonPipeClient client, string toolName, string op, CancellationToken cancel)
     {
         var request = Envelope(new JsonObject { ["action"] = "acquire" }, "acquire");
-        bool layered = _defaultLayered ? _leaseMode != "exclusive" && Core.Layers.LayerHub.SupportsOperation(op)
-            : _layeredLaunchCount > 0;
+        bool layered = _defaultLayered || _layeredLaunchCount > 0;
         if (layered)
         {
             request["mode"] = "layered";
@@ -450,7 +484,7 @@ internal sealed class McpServer : IDisposable
                     new JsonObject
                     {
                         ["type"] = "text",
-                        ["text"] = $"Seat screen, {result.Int("width")}x{result.Int("height")} "
+                        ["text"] = $"{(result.Str("mode") == ForegroundHost.Mode ? "Foreground screen" : "Seat screen")}, {result.Int("width")}x{result.Int("height")} "
                                  + $"(captured at {result.Int("sourceWidth")}x{result.Int("sourceHeight")}). "
                                  + "Click coordinates use the captured size, not the scaled image."
                     })
@@ -573,5 +607,9 @@ internal sealed class McpServer : IDisposable
 
     private static JsonObject TextResult(string text, bool isError = false) => McpSession.TextResult(text, isError);
 
-    public void Dispose() => _daemon?.Dispose();
+    public void Dispose()
+    {
+        _foreground?.Dispose();
+        _daemon?.Dispose();
+    }
 }

@@ -43,6 +43,43 @@ internal static class McpChecks
         () => throw new InvalidOperationException("a self-test tried to launch a daemon"),
         () => "self-test: daemon startup is disabled", agentId, workingDirectory ?? Path.GetTempPath());
 
+    public static async Task<string> CodexLeaseDefaults()
+    {
+        string? previous = Environment.GetEnvironmentVariable("ANODE_MCP_DEFAULT_LAYERED");
+        Environment.SetEnvironmentVariable("ANODE_MCP_DEFAULT_LAYERED", "1");
+        try
+        {
+            string pipe = PipeName();
+            var requestedModes = new List<string?>();
+            using var daemon = new JsonPipeServer(pipe, request =>
+            {
+                if (request.Str("action") == "acquire")
+                {
+                    requestedModes.Add(request.Str("mode"));
+                    return Task.FromResult(JsonLine.Ok(new JsonObject { ["mode"] = request.Str("mode"), ["leaseToken"] = "test-lease" }));
+                }
+                return Task.FromResult(JsonLine.Ok());
+            });
+            daemon.Start();
+            using var backend = Isolated(pipe);
+            Task<JsonObject> Call(string tool, JsonObject args) => backend.CallAsync(tool, args, CancellationToken.None);
+            Require((await Call("gamepad_attach", new())).Bool("isError") == true && requestedModes.Count == 0,
+                "a whole-desktop tool implicitly acquired a lease");
+            foreach (string? mode in new[] { null, "exclusive", null })
+            {
+                var args = new JsonObject { ["action"] = "acquire" };
+                if (mode is not null) args["mode"] = mode;
+                Require((await Call("seat_lease", args)).Bool("isError") != true, "explicit or default acquire failed");
+                Require((await Call("seat_lease", new() { ["action"] = "release" })).Bool("isError") != true, "lease release failed");
+            }
+            Require((await Call("seat_windows", new())).Bool("isError") != true, "implicit partition acquire failed");
+            Require(requestedModes.SequenceEqual(new[] { "layered", "exclusive", "layered", "layered" }),
+                "an omitted lease mode did not select a partition");
+            return "omitted and implicit leases use regions; whole-desktop tools require an explicit exclusive lease";
+        }
+        finally { Environment.SetEnvironmentVariable("ANODE_MCP_DEFAULT_LAYERED", previous); }
+    }
+
     public static async Task<string> LeaseClientProcess()
     {
         string? configured = Environment.GetEnvironmentVariable("ANODE_AGENT_ID");

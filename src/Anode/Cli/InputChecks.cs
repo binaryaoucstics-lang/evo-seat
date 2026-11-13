@@ -19,6 +19,49 @@ internal static class InputChecks
     // a, b, Enter (the \r is dropped), Tab, c, an emoji kept whole, d: 7 characters.
     private const string Sample = "ab\r\n\tc\U0001F600d";
 
+    public static string DragPaths()
+    {
+        var legacy = new JsonObject { ["fromX"] = 0, ["fromY"] = 0, ["toX"] = 9, ["toY"] = 0 };
+        Require(Tools.ValidateArguments("seat_drag", legacy) is null, "old endpoint syntax no longer works");
+        var shortStroke = DragPath.Moves(DragPath.Read(legacy));
+        Require(shortStroke.Length < 4 && shortStroke[^1] == new Point(9, 0), "short stroke should reach its endpoint with few moves");
+        var request = JsonNode.Parse("""{"points":[{"x":1,"y":2},{"x":1,"y":2},{"x":9,"y":3},{"x":50,"y":23},{"x":51,"y":-9}]}""")!.AsObject();
+        Require(Tools.ValidateArguments("seat_drag", request) is null, "ordered point input was refused");
+        var points = DragPath.Read(request);
+        var moves = DragPath.Moves(points);
+        Require(moves.Length > shortStroke.Length && moves[^1] == points[^1]
+            && Array.IndexOf(moves, points[2]) < Array.IndexOf(moves, points[3]) && !moves.Contains(points[0]),
+            "waypoints were skipped, reordered, or generated a duplicate move");
+        var events = new List<(string Kind, Point Position)>();
+        void Drag(CancellationToken stop, Action<Point> move) => InputInjector.Drag(points,
+            point => events.Add(("down", point)), move, () => events.Add(("up", Point.Empty)), stop);
+        Drag(CancellationToken.None, point => events.Add(("move", point)));
+        Require(events[0] == ("down", points[0]) && events[^1].Kind == "up"
+            && events.Skip(1).SkipLast(1).SequenceEqual(moves.Select(point => ("move", point))),
+            "a multi-point path did not use one mouse press and release");
+        events.Clear();
+        using var stop = new CancellationTokenSource();
+        try
+        {
+            Drag(stop.Token, point => { events.Add(("move", point)); stop.Cancel(); });
+            throw new InvalidOperationException("a cancelled drag continued");
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        Require(events.Select(item => item.Kind).SequenceEqual(new[] { "down", "move", "up" }), "cancellation did not release the mouse");
+        var overBudget = Enumerable.Range(0, 32).Select(i => new Point(i % 2 == 0 ? 1 : 500, 1)).ToArray();
+        try { DragPath.Moves(overBudget); throw new InvalidOperationException("accepted an oversized drag"); }
+        catch (ArgumentException) { }
+        foreach (var malformed in new[]
+        {
+            """{"points":[{"x":1,"y":2}]}""",
+            """{"points":[{"x":1,"y":2},{"x":3}]}""",
+            """{"points":[{"x":1,"y":2},{"x":3,"y":4}],"fromX":1}""",
+            """{"fromX":1,"fromY":2,"toX":3}"""
+        })
+            Require(Tools.ValidateArguments("seat_drag", JsonNode.Parse(malformed)!.AsObject()) is not null, "incomplete or mixed drag accepted");
+        return "adaptive spacing, ordered waypoints, one press per stroke, release on cancellation, and bounded input";
+    }
+
     private sealed class Recorder
     {
         public double Now;

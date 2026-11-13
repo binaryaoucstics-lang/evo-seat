@@ -56,12 +56,19 @@ internal static class SeatDesktop
     }
 
     internal static bool IsActive()
+        => IsActive(Name);
+
+    internal static bool IsActive(string name)
     {
         var desktop = OpenInputDesktop(0, false, ReadObjects);
         if (desktop == IntPtr.Zero) return false;
-        try { return HasName(desktop, Name); }
+        try { return HasName(desktop, name); }
         finally { CloseDesktop(desktop); }
     }
+
+    internal static bool IsInteractiveDefault()
+        => HasName(GetProcessWindowStation(), "WinSta0")
+            && HasName(GetThreadDesktop(GetCurrentThreadId()), "Default") && IsActive("Default");
 
     private static bool HasName(IntPtr desktop, string expected)
     {
@@ -75,6 +82,7 @@ internal static class SeatDesktop
     [DllImport("user32.dll", SetLastError = true)] private static extern bool SwitchDesktop(IntPtr desktop);
     [DllImport("user32.dll")] private static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll")] private static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll")] private static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll")] private static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]

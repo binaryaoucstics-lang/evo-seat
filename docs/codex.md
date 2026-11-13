@@ -9,7 +9,7 @@ Run these steps in PowerShell on the Windows machine where Codex will use the de
 This example installs the pinned release into a versioned folder under your user account. Use a new directory if you have already unpacked this version.
 
 ```powershell
-$version = 'v0.4.0'
+$version = 'v0.5.0'
 $download = "https://github.com/binaryaoucstics-lang/evo-seat/releases/download/$version"
 $asset = 'evo-seat-windows-x64.zip'
 $install = Join-Path $env:LOCALAPPDATA "Programs\EVOSeat\$version"
@@ -64,7 +64,11 @@ A stopped status is a valid response before acquisition. If acquisition fails, u
 
 ## 4. Watch background tasks
 
-A new desktop lease opens a read-only live window on the foreground desktop. The exclusive seat defaults to 1440 × 900. The window fits concurrent layouts to the display, outlining and numbering each region and highlighting those in use. Choose **接管鼠标** (Take control) to send mouse and keyboard input to the background desktop, then **归还控制** (Release control) to return to read-only viewing. Use **隐藏画面** (Hide picture) to close the window and **实时监看** (Watch live) in the system tray to reopen it.
+A new desktop lease opens a read-only live window on the foreground desktop. The exclusive seat defaults to 1440 × 900. The window fits concurrent layouts to the display, outlining and numbering each region and highlighting those in use. Choose **接管鼠标** (Take control) to send mouse and keyboard input to the background desktop, then **归还控制** (Release control) to return to read-only viewing. Minimize and restore the monitor from the taskbar while background capture keeps running. Closing the monitor or choosing **隐藏画面** (Hide picture) sends it to the system tray. Double-click the tray icon or choose **实时监看** (Watch live) to reopen the view with region borders. Choose **高级控制** (Advanced controls) to open the management view.
+
+Acquire `seat_lease({action:"acquire", mode:"foreground"})` only when the user explicitly requests the Windows main desktop. Its lease is independent of the twelve background regions. It requires an unlocked Windows console, and screenshot coordinates refer to its primary monitor. Inspect the target after acquiring the lease, then release it when finished. Releasing the foreground lease leaves its applications open.
+
+For one continuous stroke, pass ordered coordinates to `seat_drag`, for example `points: [{x:100,y:160},{x:125,y:140},{x:155,y:135},{x:185,y:148}]`. Each stroke accepts up to 128 points and holds the mouse button down along the path. Straight drags still accept `fromX`, `fromY`, `toX`, and `toY`. Each segment uses a number of moves based on its length.
 
 For concurrent work, let each Codex chat acquire its own lease with `layerCount` omitted. The third task adds a second row to the live window. The first two keep their original applications and coordinates.
 

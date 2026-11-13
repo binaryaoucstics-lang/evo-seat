@@ -176,6 +176,8 @@ internal static class SeatHost
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(DesktopStopping.Token, connection);
         if (op == "lease")
         {
+            if (request.Str("mode") == ForegroundHost.Mode)
+                return JsonLine.Fail("Foreground leases cannot be acquired in the background seat.");
             Task<JsonObject> layerChange;
             await ModeGate.WaitAsync(cancel.Token).ConfigureAwait(false);
             try
@@ -253,13 +255,11 @@ internal static class SeatHost
         }
         bool desktop = DesktopTools.ToolName(op) is not null;
         bool changesUi = op.StartsWith("input.", StringComparison.Ordinal) || op is "run" or "steam.launch" or "ps.kill" or "android.studio" or "browser.open";
-        if (!desktop && !changesUi) return Dispatch(op, request, cancel);
         if (changesUi) Desktop.InvalidateObservations();
         // Typing can take most of a request's time, so it stops at the request's deadline, or at a shutdown sent on
         // another connection. The daemon's own shutdown waits behind it; the sign-out that follows ends it.
-        if (op == "input.text")
-            return InputInjector.TypeText(request.Str("text") ?? throw new ArgumentException("text needs 'text'."),
-                request.Int("perCharMs"), request.Int("timeoutMs") ?? 60_000, cancel);
+        if (op == "screenshot" || op.StartsWith("input.", StringComparison.Ordinal))
+            return DesktopInput.Dispatch(op, request, cancel);
         return desktop ? await Desktop.HandleAsync(op, request, cancel).ConfigureAwait(false) : Dispatch(op, request, cancel);
     }
 
@@ -304,7 +304,6 @@ internal static class SeatHost
         return reply;
     }
 
-    /// <param name="cancel">Ends input holds and screen waits at the request's deadline.</param>
     private static JsonObject Dispatch(string op, JsonObject r, CancellationToken cancel = default)
     {
         switch (op)
@@ -332,103 +331,6 @@ internal static class SeatHost
                     ["cursor"] = new JsonObject { ["x"] = cursor.X, ["y"] = cursor.Y }
                 });
             }
-
-            case "screenshot":
-            {
-                var shot = ScreenCapture.Capture(
-                    maxWidth: r.Int("maxWidth"),
-                    format: r.Str("format") ?? "png",
-                    jpegQuality: r.Int("quality") ?? 80, cancel: cancel, timeoutMs: Math.Min(5000, r.Int("timeoutMs") ?? 60000));
-
-                return JsonLine.Ok(new JsonObject
-                {
-                    ["mimeType"] = shot.MimeType,
-                    ["width"] = shot.Width,
-                    ["height"] = shot.Height,
-                    ["sourceWidth"] = shot.SourceWidth,
-                    ["sourceHeight"] = shot.SourceHeight,
-                    ["bytes"] = shot.Bytes.Length,
-                    ["data"] = Convert.ToBase64String(shot.Bytes)
-                });
-            }
-
-            case "input.move":
-            {
-                int? dx = r.Int("dx");
-                int? dy = r.Int("dy");
-                if (dx.HasValue || dy.HasValue)
-                {
-                    // Relative motion, which is what games reading raw input expect.
-                    InputInjector.MoveBy(dx ?? 0, dy ?? 0);
-                }
-                else
-                {
-                    int x = r.Int("x") ?? throw new ArgumentException("move needs x and y, or dx and dy.");
-                    int y = r.Int("y") ?? throw new ArgumentException("move needs x and y, or dx and dy.");
-                    InputInjector.MoveTo(x, y);
-                }
-                var at = InputInjector.CursorPosition();
-                return JsonLine.Ok(new JsonObject { ["x"] = at.X, ["y"] = at.Y });
-            }
-
-            case "input.click":
-            {
-                InputInjector.Click(
-                    r.Str("button") ?? "left",
-                    r.Int("x"), r.Int("y"),
-                    r.Int("count") ?? 1,
-                    r.Int("holdMs") ?? 20, cancel);
-                return JsonLine.Ok();
-            }
-
-            case "input.down":
-                InputInjector.MouseDown(r.Str("button") ?? "left", r.Int("x"), r.Int("y"));
-                return JsonLine.Ok();
-
-            case "input.up":
-                InputInjector.MouseUp(r.Str("button") ?? "left", r.Int("x"), r.Int("y"));
-                return JsonLine.Ok();
-
-            case "input.drag":
-                InputInjector.Drag(
-                    r.Int("fromX") ?? throw new ArgumentException("drag needs fromX."),
-                    r.Int("fromY") ?? throw new ArgumentException("drag needs fromY."),
-                    r.Int("toX") ?? throw new ArgumentException("drag needs toX."),
-                    r.Int("toY") ?? throw new ArgumentException("drag needs toY."),
-                    r.Str("button") ?? "left",
-                    r.Int("steps") ?? 24,
-                    r.Int("stepMs") ?? 8, cancel);
-                return JsonLine.Ok();
-
-            case "input.scroll":
-            {
-                int amount = r.Int("amount") ?? -3;
-                bool horizontal = r.Bool("horizontal") ?? false;
-                long notches = Math.Abs((long)amount);
-                string direction = horizontal ? (amount < 0 ? "left" : "right") : (amount < 0 ? "down" : "up");
-                return JsonLine.Ok(ScreenSettle.Real(() => InputInjector.Scroll(amount, horizontal),
-                    $"Scrolled {notches} {(notches == 1 ? "notch" : "notches")} {direction}", r.Int("timeoutMs") ?? 60_000, cancel));
-            }
-
-            case "input.key":
-            {
-                string keys = r.Str("keys") ?? throw new ArgumentException("key needs 'keys', for example \"ctrl+s\".");
-                void Press() => InputInjector.Press(keys, r.Int("holdMs") ?? 40, r.Bool("scanCode") ?? true, cancel);
-                if (ScreenSettle.IsScrollingKey(keys))
-                    return JsonLine.Ok(ScreenSettle.Real(Press, $"Pressed {keys}", r.Int("timeoutMs") ?? 60_000, cancel));
-                Press();
-                return JsonLine.Ok();
-            }
-
-            case "input.keydown":
-                InputInjector.KeyDown(r.Str("key") ?? throw new ArgumentException("keydown needs 'key'."),
-                    r.Bool("scanCode") ?? true);
-                return JsonLine.Ok();
-
-            case "input.keyup":
-                InputInjector.KeyUp(r.Str("key") ?? throw new ArgumentException("keyup needs 'key'."),
-                    r.Bool("scanCode") ?? true);
-                return JsonLine.Ok();
 
             case "run":
                 return RunProgram(r, ChildSession.CurrentSessionId(), rememberLaunch: Desktop.RememberLaunch);

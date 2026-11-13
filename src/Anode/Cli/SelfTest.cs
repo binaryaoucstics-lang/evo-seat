@@ -54,6 +54,7 @@ internal static class SelfTest
         var results = new List<(string Name, bool Ok, string Detail)>();
 
         Check(results, "key names and chords", InputChecks.KeyChords);
+        Check(results, "adaptive drag path", InputChecks.DragPaths);
         Check(results, "text typing pace", InputChecks.Pacing);
         Check(results, "text typing limits", InputChecks.Limits);
         Check(results, "key and tap holds", InputChecks.Holds);
@@ -176,6 +177,7 @@ internal static class SelfTest
         Check(results, "agent names", () => AgentChecks.Names().GetAwaiter().GetResult());
         Check(results, "MCP ownership", () => AgentChecks.McpOwnership().GetAwaiter().GetResult());
         Check(results, "MCP lease helper", () => AgentChecks.McpLeaseHelper().GetAwaiter().GetResult());
+        Check(results, "Codex lease defaults", () => McpChecks.CodexLeaseDefaults().GetAwaiter().GetResult());
         Check(results, "agent startup and Stop", () => AgentChecks.StartupAndStop().GetAwaiter().GetResult());
         Check(results, "UI condition waits", () => DevelopmentChecks.Waits().GetAwaiter().GetResult());
         Check(results, "development validation", DevelopmentChecks.Validation);
@@ -202,6 +204,7 @@ internal static class SelfTest
         Check(results, "audio playback lifetime", () => AudioChecks.Lifecycle().GetAwaiter().GetResult());
         Check(results, "viewer check deadlines", DevelopmentChecks.ViewerDeadlines);
         Check(results, "hidden viewer startup", DevelopmentChecks.HiddenViewer);
+        Check(results, "reopen live monitor from tray", DevelopmentChecks.ReopenMonitor);
         Check(results, "viewer pointer guard", DiagnosticsChecks.ViewerPointerGuard);
         Check(results, "RDP extended settings", DiagnosticsChecks.RdpSettings);
         Check(results, "RDP event callbacks", DiagnosticsChecks.RdpCallbacks);

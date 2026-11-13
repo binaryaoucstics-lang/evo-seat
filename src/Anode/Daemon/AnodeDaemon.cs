@@ -135,6 +135,10 @@ internal sealed class AnodeDaemon : IDisposable
         _window.ReconnectRequested += () => _ = ReconnectAsync();
         _window.SignInRequested += () => _ = ReconnectAsync(promptForCredentials: true);
         _window.QuitRequested += Quit;
+        _window.VisibleChanged += (_, _) =>
+        {
+            if (_window.Visible) _ = Task.Run(WatchDeskAsync);
+        };
         _window.Viewer.Connected += OnViewerConnected;
         _window.Viewer.LoginComplete += OnViewerLoginComplete;
         _window.Viewer.Disconnected += OnViewerDisconnected;
@@ -842,6 +846,8 @@ internal sealed class AnodeDaemon : IDisposable
                 return await StartSeatAsync().WaitAsync(connection).ConfigureAwait(false);
 
             case "lease":
+                if (request.Str("mode") == Core.Desktop.ForegroundHost.Mode)
+                    return JsonLine.Fail("Foreground leases are routed by the MCP server, not the background daemon.");
                 if (_stopRequested && _state != "stopped")
                     return JsonLine.Fail("The seat is stopping or has failed to stop. Wait for Stop to finish before acquiring a desktop lease.");
                 // A client helper acquiring on an agent's behalf passes startSeat=false: only an
@@ -861,8 +867,8 @@ internal sealed class AnodeDaemon : IDisposable
                             if (!_hostReady || _stopRequested || stopVersion != Volatile.Read(ref _stopVersion)) return;
                             try
                             {
-                                viewer.ShowMonitor();
-                                _ = Task.Run(WatchDeskAsync);
+                                if (viewer.Visible) _ = Task.Run(WatchDeskAsync);
+                                else viewer.ShowMonitor();
                             }
                             catch (Exception ex) { Log.Warn($"Could not open the live monitor: {ex.Message}"); }
                         }));

@@ -35,6 +35,7 @@ internal static class InputInjector
     private const uint MouseEventXUp = 0x0100;
     private const uint MouseEventWheel = 0x0800;
     private const uint MouseEventHWheel = 0x1000;
+    private const uint MouseEventMoveNoCoalesce = 0x2000;
     private const uint MouseEventAbsolute = 0x8000;
 
     private const uint KeyEventExtended = 0x0001;
@@ -121,10 +122,13 @@ internal static class InputInjector
             throw Native.Native.LastError($"SendInput accepted {sent} of {inputs.Length} events");
     }
 
+    // Only the foreground host registers a guard. Recheck between drag steps and typed characters.
+    internal static Func<string?>? DesktopGuard { get; set; }
+
     /// <summary>Sends the events unless the seat's input is blocked, and returns how many Windows accepted.</summary>
     private static uint SendCounted(Input[] inputs, out string? blocked)
     {
-        blocked = Desktop.WindowAccess.InputBlockReason();
+        blocked = DesktopGuard?.Invoke() ?? Desktop.WindowAccess.InputBlockReason();
         return blocked is null ? SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) : 0;
     }
 
@@ -142,7 +146,7 @@ internal static class InputInjector
                 earlierPartSent || sent > 0);
     }
 
-    private static Input AbsoluteMove(int x, int y)
+    private static Input AbsoluteMove(int x, int y, uint extraFlags = 0)
     {
         var size = ScreenSize();
         int nx = (int)Math.Round(Math.Clamp(x, 0, size.Width - 1) * 65535.0 / Math.Max(1, size.Width - 1));
@@ -150,7 +154,7 @@ internal static class InputInjector
         return new Input
         {
             Type = InputMouse,
-            Union = { Mouse = new MouseInput { Dx = nx, Dy = ny, Flags = MouseEventMove | MouseEventAbsolute } }
+            Union = { Mouse = new MouseInput { Dx = nx, Dy = ny, Flags = MouseEventMove | MouseEventAbsolute | extraFlags } }
         };
     }
 
@@ -219,31 +223,42 @@ internal static class InputInjector
         }
     });
 
-    public static void Drag(int fromX, int fromY, int toX, int toY, string button = "left", int steps = 24, int stepMs = 8,
+    public static void Drag(IReadOnlyList<Point> points, string button = "left",
         CancellationToken cancel = default, Func<bool>? ownsFocus = null, Func<Point, bool>? ownsPoint = null)
+        => Drag(points, start => MouseDown(button, start.X, start.Y),
+            move => Send(AbsoluteMove(move.X, move.Y, MouseEventMoveNoCoalesce)),
+            () => MouseUp(button), cancel, ownsFocus, ownsPoint);
+
+    internal static void Drag(IReadOnlyList<Point> points, Action<Point> down, Action<Point> move, Action up,
+        CancellationToken cancel, Func<bool>? ownsFocus = null, Func<Point, bool>? ownsPoint = null)
     {
         cancel.ThrowIfCancellationRequested();
-        if (ownsPoint is not null && !ownsPoint(new Point(fromX, fromY)))
-            throw new InvalidOperationException("The drag start is no longer over the selected window.");
-        MouseDown(button, fromX, fromY);
+        var moves = DragPath.Moves(points);
+        if (ownsPoint is not null && !ownsPoint(points[0]))
+            throw new InvalidOperationException("The drag start is no longer over the selected window. No mouse input was sent.");
+        // WaitOne rounds short waits up to the Windows scheduling tick. Use the
+        // same high-resolution timer as typing for the drag cadence.
+        using var timer = moves.Length != 0 ? new TextTyping.PreciseTimer() : null;
+        cancel.ThrowIfCancellationRequested();
+        down(points[0]);
         try
         {
-            steps = Math.Max(1, steps);
-            for (int i = 1; i <= steps; i++)
+            // A stationary drag still holds briefly, so paint tools can leave a dot.
+            if (moves.Length == 0 && Hold(8, cancel)) cancel.ThrowIfCancellationRequested();
+            foreach (var next in moves)
             {
                 cancel.ThrowIfCancellationRequested();
                 if (ownsFocus is not null && !ownsFocus()) throw new InvalidOperationException("The drag target lost focus. Inspect before acting again.");
-                int x = fromX + (toX - fromX) * i / steps;
-                int y = fromY + (toY - fromY) * i / steps;
-                if (ownsPoint is not null && !ownsPoint(new Point(x, y)))
+                if (ownsPoint is not null && !ownsPoint(next))
                     throw new InvalidOperationException("The drag crossed another window. Inspect before acting again.");
-                MoveTo(x, y);
-                if (Hold(stepMs, cancel)) cancel.ThrowIfCancellationRequested();
+                move(next);
+                timer!.Wait(DragPath.StepMs);
+                cancel.ThrowIfCancellationRequested();
             }
         }
         finally
         {
-            MouseUp(button);
+            up();
         }
     }
 
@@ -282,6 +297,8 @@ internal static class InputInjector
     }
 
     /// <summary>Release only input issued by this host, under the desktop ownership gate.</summary>
+    internal static bool HasHeldInput => HeldMouse.Count != 0 || HeldKeys.Count != 0;
+
     public static void ReleaseHeld()
     {
         foreach (var button in HeldMouse.ToArray())

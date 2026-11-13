@@ -11,16 +11,17 @@ internal static class DesktopWorker
 {
     // The CLI entry point is STA. Keep each worker's UIA calls on the same MTA
     // thread so a busy seat does not reschedule every action through its pool.
-    public static int Run() => Task.Run(RunWorker).GetAwaiter().GetResult();
+    public static int Run(bool foreground = false) => Task.Run(() => RunWorker(foreground)).GetAwaiter().GetResult();
 
-    private static int RunWorker()
+    private static int RunWorker(bool foreground)
     {
         // Window and control bounds in the seat's physical pixels, the space its screenshots and input use at every scale.
         Display.SeatDisplay.UsePhysicalPixels();
         using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         try
         {
-            Seat.SeatHost.VerifyCurrentSession();
+            if (foreground) ForegroundHost.VerifyDesktop();
+            else Seat.SeatHost.VerifyCurrentSession();
             using var input = new StreamReader(Console.OpenStandardInput());
             bool persistent;
             do
@@ -29,10 +30,11 @@ internal static class DesktopWorker
                 if (line is null) return 0;
                 if (line.Length > 4_000_000) throw new ArgumentException("Worker request is too large.");
                 var request = JsonLine.Parse(line) ?? throw new ArgumentException("Invalid worker request.");
+                if (foreground) ForegroundHost.VerifyDesktop();
                 bool clipboard = request.Str("op") is "clipboard.read" or "clipboard.write";
                 if (!clipboard && line.Length > 131072) throw new ArgumentException("Worker request is too large.");
                 persistent = request.Bool("persistentWorker") == true;
-                var result = clipboard ? LayerClipboard.ExecuteNative(request) : Execute(request);
+                var result = clipboard ? LayerClipboard.ExecuteNative(request) : Execute(request, foreground);
                 output.WriteLine(JsonLine.Ok(result).ToJsonString());
             } while (persistent);
             return 0;
@@ -44,12 +46,12 @@ internal static class DesktopWorker
         }
     }
 
-    internal static JsonObject Execute(JsonObject request)
+    internal static JsonObject Execute(JsonObject request, bool foreground = false)
     {
         string op = request.Str("op") ?? "";
         if (op == "ready") return new JsonObject();
         if (op == "windows") return new JsonObject { ["windows"] = WindowAccess.List() };
-        if (op == "capabilities") return SeatCapabilities.Read(request.Bool("probeCapture") ?? true);
+        if (op == "capabilities") return SeatCapabilities.Read(request.Bool("probeCapture") ?? true, foreground);
         var target = WindowTarget.FromJson(request.Obj("target") ?? throw new ArgumentException("Missing worker target."));
         return op switch
         {
@@ -97,14 +99,22 @@ internal static class DesktopWorker
         return await ExchangeAsync(process, request, TimeSpan.FromSeconds(10), cancel).ConfigureAwait(false);
     }
 
-    private static Process Start()
+    public static async Task<JsonObject> CallForegroundAsync(JsonObject request, CancellationToken cancel)
+    {
+        using var process = Start(foreground: true);
+        return await ExchangeAsync(process, request, TimeSpan.FromSeconds(10), cancel).ConfigureAwait(false);
+    }
+
+    private static Process Start() => Start(foreground: false);
+
+    private static Process Start(bool foreground)
     {
         var info = new ProcessStartInfo(Env.ExecutablePath)
         {
             UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
             RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
         };
-        info.ArgumentList.Add("__desktop-worker");
+        info.ArgumentList.Add(foreground ? "__foreground-worker" : "__desktop-worker");
         return Process.Start(info) ?? throw new InvalidOperationException("Could not start the seat inspection worker.");
     }
 

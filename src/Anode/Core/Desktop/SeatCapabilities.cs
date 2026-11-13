@@ -6,8 +6,8 @@ namespace Anode.Core.Desktop;
 
 internal static class SeatCapabilities
 {
-    // Called only by the disposable worker after verifying its child session.
-    public static JsonObject Read(bool probeCapture)
+    // Called by the disposable worker after verifying its desktop.
+    public static JsonObject Read(bool probeCapture, bool foreground = false)
     {
         var display = Display.SeatDisplay.Measure();
         var capture = new JsonObject { ["tested"] = probeCapture, ["available"] = null };
@@ -23,6 +23,16 @@ internal static class SeatCapabilities
             }
             catch (Exception ex) { capture["available"] = false; capture["error"] = ex.Message; }
         }
+        if (foreground)
+            return new JsonObject
+            {
+                ["version"] = typeof(SeatCapabilities).Assembly.GetName().Version?.ToString(3),
+                ["mode"] = ForegroundHost.Mode, ["session"] = ChildSession.CurrentSessionId(),
+                ["screen"] = display.ToJson(), ["capture"] = capture,
+                ["input"] = new JsonObject { ["deliveryVerified"] = false, ["knownBlocker"] = inputWarning is not null, ["warning"] = inputWarning },
+                ["supported"] = new JsonArray("window discovery", "UI Automation", "control actions", "UI waits",
+                    "primary monitor screenshots", "mouse and keyboard", "app launch")
+            };
         return new JsonObject
         {
             ["version"] = typeof(SeatCapabilities).Assembly.GetName().Version?.ToString(3),

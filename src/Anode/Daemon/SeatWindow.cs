@@ -57,6 +57,7 @@ internal sealed class SeatWindow : Form
     private bool _fullScreen;
     private bool _viewOnly = true;
     private bool _monitorMode;
+    private bool _wasMinimized;
     private bool _noActivate = true;
     private bool _reallyClosing;
     private bool _hotkeyAvailable;
@@ -135,6 +136,7 @@ internal sealed class SeatWindow : Form
 
         ViewOnly = options.StartViewOnly;
         KeyDown += OnKeyDown;
+        Resize += (_, _) => MonitorWindowStateChanged();
     }
 
     /// <summary>
@@ -193,7 +195,7 @@ internal sealed class SeatWindow : Form
     private void PlaceSeat()
     {
         var area = _seatArea.ClientSize;
-        if ((!_fitSeat && !_monitorMode) || area.Width <= 0 || area.Height <= 0) return;
+        if (WindowState == FormWindowState.Minimized || (!_fitSeat && !_monitorMode) || area.Width <= 0 || area.Height <= 0) return;
         var picture = _monitorMode ? MonitorPictureSize(_seatSize, area) : FitPicture(_seatSize, area);
         int width = picture.Width, height = picture.Height;
         var bounds = new Rectangle((area.Width - width) / 2, (area.Height - height) / 2, width, height);
@@ -227,6 +229,23 @@ internal sealed class SeatWindow : Form
         _regionFrames.UpdateFrames(Viewer.Bounds, _seatSize,
             _regions.Length == 0 ? [new SeatRegion(1, new Rectangle(Point.Empty, _seatSize), true)] : _regions,
             controlling: !ViewOnly);
+    }
+
+    private void MonitorWindowStateChanged()
+    {
+        bool minimized = WindowState == FormWindowState.Minimized;
+        if (minimized == _wasMinimized) return;
+        _wasMinimized = minimized;
+        if (!_monitorMode) return;
+        if (minimized)
+        {
+            if (!ViewOnly) ViewOnly = true;
+        }
+        else
+        {
+            FitMonitor(Screen.FromControl(this));
+            PlaceSeat();
+        }
     }
 
     private static Size FitPicture(Size seat, Size area)
@@ -429,8 +448,8 @@ internal sealed class SeatWindow : Form
         };
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("实时监看", null, (_, _) => ShowMonitor());
-        menu.Items.Add("Show the seat", null, (_, _) => ShowViewer());
+        menu.Items.Add(new ToolStripMenuItem("实时监看", null, (_, _) => OpenMonitorFromTray()) { Name = "OpenLiveMonitor" });
+        menu.Items.Add("高级控制", null, (_, _) => ShowViewer());
         menu.Items.Add(_traySignIn);
         menu.Items.Add("Stop the seat", null, (_, _) => StopSeatRequested?.Invoke());
         menu.Items.Add(new ToolStripSeparator());
@@ -445,7 +464,7 @@ internal sealed class SeatWindow : Form
         _tray.Text = TrayText(null);
         _tray.Visible = visible;
         _tray.ContextMenuStrip = menu;
-        _tray.DoubleClick += (_, _) => ShowViewer();
+        _tray.DoubleClick += (_, _) => OpenMonitorFromTray();
     }
 
     private static string TrayText(uint? sessionId)
@@ -634,25 +653,49 @@ internal sealed class SeatWindow : Form
     {
         if (InvokeRequired) { BeginInvoke(new Action(ShowViewer)); return; }
         SetMonitorMode(false);
-        Show();
-        if (WindowState == FormWindowState.Minimized) WindowState = _restoreState;
-        ClearNoActivate();
-        Activate();
+        ShowAndActivate();
     }
 
-    internal void ShowMonitor()
+    internal void ShowMonitor() => OpenMonitor(activate: false);
+
+    private void OpenMonitorFromTray() => OpenMonitor(activate: true);
+
+    private void OpenMonitor(bool activate)
     {
-        // Respect an open viewer, including an explicit handover of mouse control.
-        if (Visible) return;
+        // An automatic show must not change a viewer the user is already looking at.
+        bool wasVisible = Visible;
+        if (wasVisible && !activate) return;
         SetMonitorMode(true);
-        if (!ViewOnly) ViewOnly = true;
+        if (!wasVisible && !ViewOnly) ViewOnly = true;
         FitMonitor(Screen.FromPoint(Cursor.Position));
+        if (activate)
+        {
+            ShowAndActivate();
+            return;
+        }
         // Reapply the no-activate flag for this show; an earlier connection may have cleared it.
         _noActivate = true;
         Native.SetWindowLong(Handle, Native.GWL_EXSTYLE,
             Native.GetWindowLong(Handle, Native.GWL_EXSTYLE) | Native.WS_EX_NOACTIVATE);
         try { Show(); }
         finally { ClearNoActivate(); }
+    }
+
+    private void ShowAndActivate()
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            // The native restore also remembers whether the window was maximized.
+            ClearNoActivate();
+            Show();
+            ShowWindow(Handle, 9); // SW_RESTORE
+        }
+        else
+        {
+            Show();
+            ClearNoActivate();
+        }
+        Activate();
     }
 
     private void SetMonitorMode(bool enabled)
@@ -680,6 +723,7 @@ internal sealed class SeatWindow : Form
         if (_monitorMode && !ViewOnly) ViewOnly = true;
         if (_fullScreen) ToggleFullScreen();
         Hide();
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
     }
 
     /// <summary>
@@ -760,6 +804,7 @@ internal sealed class SeatWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        SetProp(Handle, Core.Desktop.WindowAccess.SeatViewerProperty, new IntPtr(1));
         ViewerTheme.ApplyFrame(Handle);
         // Measured again on the monitor the window opens on, whose DPI sizes its frame and bars; only once,
         // so later handles (full screen changes the border) keep the size the user chose.
@@ -779,17 +824,29 @@ internal sealed class SeatWindow : Form
         RefreshDetails();
     }
 
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetProp(IntPtr handle, string name, IntPtr value);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern IntPtr RemoveProp(IntPtr handle, string name);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr handle, int command);
+
     protected override void OnHandleDestroyed(EventArgs e)
     {
+        RemoveProp(Handle, Core.Desktop.WindowAccess.SeatViewerProperty);
         try { Native.UnregisterHotKey(Handle, HotkeyId); } catch { }
         base.OnHandleDestroyed(e);
     }
 
     protected override void WndProc(ref Message m)
     {
-        // Hiding keeps the ActiveX client out of its minimized-window path.
-        // The per-user RDP rendering preference also prevents display suppression.
-        if (m.Msg == 0x0112 && (m.WParam.ToInt64() & 0xFFF0) == 0xF020)
+        // Keep the old hide behavior for advanced controls. The live monitor
+        // minimizes to the taskbar and uses the RDP background-rendering setting.
+        if (!_monitorMode && m.Msg == 0x0112 && (m.WParam.ToInt64() & 0xFFF0) == 0xF020)
         {
             HideViewer();
             return;

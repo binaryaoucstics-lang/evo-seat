@@ -41,7 +41,7 @@ async function handle(request: JsonRpcRequest, signal: AbortSignal) {
           websiteUrl: "https://github.com/binaryaoucstics-lang/evo-seat",
         },
         instructions: [
-          "In Codex, seat_lease acquire defaults to a concurrent region. Omit layerCount so the live layout grows as tasks join. Use mode:exclusive for global tools that need the whole desktop. Release your lease when the task is finished.",
+          "In Codex, use a background region by default. Omit layerCount so the layout grows as tasks join. Only use mode=foreground when the user explicitly asks for the main Windows desktop. Tools that require the whole background desktop need an explicit mode=exclusive lease, which blocks other background tasks until release.",
           result.instructions?.replace("Default mode=exclusive preserves the original shared desktop lease and first-come waiting. ", ""),
           "Use seat_element with observeAfter:true to get a fresh text snapshot after intermediate actions. Verify final submissions separately.",
           "When a transient loading label is visible, use seat_wait for that exact name with state:missing and waitMs:5000. Inspect the result, including when matched is false.",
@@ -63,7 +63,7 @@ async function handle(request: JsonRpcRequest, signal: AbortSignal) {
         return { ...tool, description: tool.description?.replace("The default exclusive mode allows one owner.",
           "Codex defaults to a concurrent region. Choose exclusive for tools that need the whole desktop."),
           inputSchema: { ...tool.inputSchema, properties: { ...properties,
-            mode: { ...properties.mode, description: "layered (Codex default) or exclusive. Only acquire. Release your current lease before switching modes." } } } };
+            mode: { ...properties.mode, description: "layered (default background), exclusive (whole background desktop), or foreground (main Windows desktop, only at the user's explicit request). Only acquire. Release your current lease before switching modes." } } } };
       }) };
     }
     case "tools/call": {

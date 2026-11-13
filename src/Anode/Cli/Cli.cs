@@ -69,6 +69,10 @@ internal static partial class Cli
                 return Seat.SeatHost.Run();
             case "__desktop-worker":
                 return Core.Desktop.DesktopWorker.Run();
+            case "__foreground-worker":
+                return Core.Desktop.DesktopWorker.Run(foreground: true);
+            case "__foreground-host":
+                return Core.Desktop.ForegroundHost.Run();
             case "__exec-worker":
                 return Core.Processes.ExecutionWorker.Run();
             case "__desktop-fixture":

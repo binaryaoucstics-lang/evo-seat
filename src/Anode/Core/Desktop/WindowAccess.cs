@@ -29,6 +29,8 @@ internal static class WindowAccess
     private struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] private static extern bool EnumWindows(Win.EnumWindowsProc callback, IntPtr parameter);
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetProp(IntPtr window, string name);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr window);
@@ -115,6 +117,11 @@ internal static class WindowAccess
 
     public static JsonObject RectangleJson(Rectangle value) => new()
         { ["x"] = value.X, ["y"] = value.Y, ["width"] = value.Width, ["height"] = value.Height };
+
+    internal const string SeatViewerProperty = "EVO.Seat.Viewer";
+
+    internal static bool IsSeatViewer(IntPtr window) =>
+        window != IntPtr.Zero && GetProp(Win.GetAncestor(window, 2), SeatViewerProperty) != IntPtr.Zero;
 
     public static string? InputBlockReason()
     {

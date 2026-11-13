@@ -85,6 +85,52 @@ internal static class DevelopmentChecks
             + "and narrow layout; no connection or shown form";
     }, checks: TimeSpan.FromSeconds(5));
 
+    public static string ReopenMonitor() => OnViewerThread(created =>
+    {
+        using var window = new Daemon.SeatWindow(new Daemon.SeatOptions(), trayIcon: false) { ShowInTaskbar = false };
+        window.CreateHiddenViewer();
+        created();
+        int cloak = 1;
+        var handle = window.Handle;
+        Require(Core.Native.Native.DwmSetWindowAttribute(handle, Core.Native.Native.DWMWA_CLOAK, ref cloak, sizeof(int)) == 0
+            && Core.Native.Native.DwmGetWindowAttribute(handle, Core.Native.Native.DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0
+            && cloaked != 0, "could not cloak the test viewer");
+        window.SetSeatPictureLive(true);
+        window.SetSeatSize(2880, 900);
+        window.SetSeatRegions(new Size(2880, 900),
+            [new(1, new Rectangle(0, 0, 1440, 900), true), new(2, new Rectangle(1440, 0, 1440, 900), true)]);
+        var frames = window.Controls.Find("SeatRegionFrames", true).Single();
+        var trayMonitor = window.TrayMenu.Items["OpenLiveMonitor"]!;
+        window.ShowMonitor();
+        Require(window.MonitorVisible && frames.Visible, "initial live monitor did not show the frames");
+        window.ViewOnly = false;
+        SendMessage(handle, 0x0112, new IntPtr(0xF020), IntPtr.Zero); // WM_SYSCOMMAND / SC_MINIMIZE
+        Require(window.Visible && window.WindowState == FormWindowState.Minimized && window.ViewOnly,
+            "minimizing the live monitor hid the window or kept control");
+        window.ShowMonitor();
+        Require(window.WindowState == FormWindowState.Minimized, "an automatic show restored a minimized viewer");
+        SendMessage(handle, 0x0112, new IntPtr(0xF120), IntPtr.Zero); // SC_RESTORE
+        Require(window.MonitorVisible && window.WindowState != FormWindowState.Minimized && frames.Visible,
+            "Windows restore did not bring back the framed monitor");
+        SendMessage(handle, 0x0112, new IntPtr(0xF020), IntPtr.Zero);
+        trayMonitor.PerformClick();
+        Require(window.MonitorVisible && window.WindowState != FormWindowState.Minimized && frames.Visible,
+            "the tray failed to restore the minimized monitor");
+        window.ViewOnly = false;
+        window.Close();
+        Require(!window.Visible && !window.IsDisposed && window.ViewOnly, "closing the monitor did not hide it and release control");
+        trayMonitor.PerformClick();
+        Require(window.MonitorVisible && frames.Visible && window.ViewOnly, "tray reopened a view without live region frames");
+        window.ShowViewer();
+        Require(!window.MonitorVisible, "advanced controls did not open");
+        trayMonitor.PerformClick();
+        Require(window.MonitorVisible && frames.Visible, "tray could not restore the monitor from advanced controls");
+        return "minimize preserves the window; native restore and tray reopen preserve frames and read-only mode";
+    }, checks: TimeSpan.FromSeconds(5));
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
+    private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
     /// <summary>
     /// The first Remote Desktop control a process creates loads mstscax.dll and its COM classes: about 0.3 s on a
     /// developer PC, up to 3 s on GitHub's hosted runners, and once more than 5 s there, which failed CI. A slow cold
