@@ -29,6 +29,8 @@ Both runs used **`gpt-6.1-sol` with `high` reasoning effort**. Each started with
 | Average total tokens per stroke (including cached input) | 28,856 | 461,231 |
 | Average uncached input plus output tokens per stroke | 193 | 3,347 |
 
+![Bar charts comparing average time and token use per stroke for EVO Seat and built-in Computer Use](docs/images/per-stroke-comparison.en.png)
+
 Times use the Codex turn log and PNG write timestamps. Token counts sum all model requests in each turn, including the conversation history sent with those requests. Codex tool calls include orchestration, such as waiting for an ongoing batch. Desktop API calls count individual `seat_*` MCP calls for EVO Seat and `sky` API calls for built-in Computer Use, including calls inside scripts. The per-stroke figures divide time through PNG save and full-turn token counts by the number of drags, so setup, screenshots, and other work are spread across the strokes.
 
 Built-in Computer Use saved its PNG 41.8 seconds sooner and used about 2.46× as many total tokens. The EVO Seat run batched more short strokes, while the built-in run refreshed the window after each action and started with more conversation history. These are two observed runs with different stroke counts and context sizes, so the table describes those workflows.

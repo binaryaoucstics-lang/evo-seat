@@ -29,6 +29,8 @@ EVO Seat 为 Codex 提供一个隐藏的 Windows 桌面。Agent 可以在里面�
 | 平均每笔总 Token（含缓存输入） | 28,856 | 461,231 |
 | 平均每笔未缓存输入与输出 Token 之和 | 193 | 3,347 |
 
+![EVO Seat 和内置 Computer Use 的每笔平均耗时与 Token 用量对比图](docs/images/per-stroke-comparison.zh-CN.png)
+
 时间取自 Codex 回合日志和 PNG 写入时间。Token 汇总各自回合内的所有模型请求，包含随请求发送的对话历史。Codex 工具调用包含等待批处理等调度调用。桌面 API 调用按实际执行次数计算，包括脚本内部的 EVO Seat `seat_*` MCP 调用和内置 Computer Use 的 `sky` API 调用。每笔平均值用保存 PNG 前的总时间、整轮 Token 分别除以拖动次数，启动、截图等开销也摊入每笔。
 
 本次内置 Computer Use 提前 41.8 秒保存 PNG，总 Token 约为 EVO Seat 的 2.46 倍。EVO Seat 将更多短笔画分批执行，内置版每次操作后刷新窗口，且开始时已有更长的对话历史。表格记录的是这两次实际流程，笔画数量和上下文长度并未统一。
